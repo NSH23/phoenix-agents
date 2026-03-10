@@ -19,53 +19,79 @@ const supabase = axios.create({
   }
 });
 
+// ─────────────────────────────────────────────
+// WHATSAPP HELPERS
+// ─────────────────────────────────────────────
 async function sendWhatsApp(phone, message) {
   try {
-    var fullPhone = phone.startsWith("+") ? phone : "+" + phone;
+    var fullPhone = phone.startsWith('+') ? phone : '+' + phone;
     var resp = await axios.post(
-      "https://graph.facebook.com/v18.0/" + WA_PHONE_ID + "/messages",
-      { messaging_product: "whatsapp", to: fullPhone, type: "text", text: { body: message } },
-      { headers: { Authorization: "Bearer " + WA_TOKEN } }
+      'https://graph.facebook.com/v18.0/' + WA_PHONE_ID + '/messages',
+      { messaging_product: 'whatsapp', to: fullPhone, type: 'text', text: { body: message } },
+      { headers: { Authorization: 'Bearer ' + WA_TOKEN } }
     );
-    console.log("✅ WA sent to " + fullPhone + " | " + JSON.stringify(resp.data));
+    console.log('WA sent to ' + fullPhone + ' | ' + JSON.stringify(resp.data));
   } catch (err) {
-    console.error("❌ WA FAILED:", JSON.stringify(err.response ? err.response.data : err.message));
+    console.error('WA FAILED:', JSON.stringify(err.response ? err.response.data : err.message));
   }
 }
 
 async function sendWhatsAppImage(phone, imageUrl, caption) {
   try {
-    var fullPhone = phone.startsWith("+") ? phone : "+" + phone;
+    var fullPhone = phone.startsWith('+') ? phone : '+' + phone;
     var resp = await axios.post(
-      "https://graph.facebook.com/v18.0/" + WA_PHONE_ID + "/messages",
-      { messaging_product: "whatsapp", to: fullPhone, type: "image", image: { link: imageUrl, caption: caption } },
-      { headers: { Authorization: "Bearer " + WA_TOKEN } }
+      'https://graph.facebook.com/v18.0/' + WA_PHONE_ID + '/messages',
+      { messaging_product: 'whatsapp', to: fullPhone, type: 'image', image: { link: imageUrl, caption: caption } },
+      { headers: { Authorization: 'Bearer ' + WA_TOKEN } }
     );
-    console.log("✅ WA image sent to " + fullPhone + " | " + JSON.stringify(resp.data));
+    console.log('WA image sent to ' + fullPhone + ' | ' + JSON.stringify(resp.data));
   } catch (err) {
-    console.error("❌ WA image FAILED:", JSON.stringify(err.response ? err.response.data : err.message));
+    console.error('WA image FAILED:', JSON.stringify(err.response ? err.response.data : err.message));
+  }
+}
+
+// ─────────────────────────────────────────────
+// SUPABASE HELPERS
+// ─────────────────────────────────────────────
+async function getLeadByPhone(phone) {
+  try {
+    var res = await supabase.get('/rest/v1/leads?phone=eq.' + phone + '&select=*');
+    return res.data && res.data[0] ? res.data[0] : null;
+  } catch (e) {
+    console.error('getLeadByPhone error:', e.message);
+    return null;
   }
 }
 
 async function getEventImage(eventType) {
   try {
-    var key = 'event_' + eventType.toLowerCase().replace(/ /g, '_') + '_image';
-    var res = await supabase.get('/rest/v1/workflow_content?content_key=eq.' + key + '&select=text_content&is_active=eq.true');
-    return res.data && res.data[0] ? res.data[0].text_content : null;
-  } catch (e) { return null; }
+    var key = 'event_' + eventType.toLowerCase().replace(/\s+/g, '_') + '_image';
+    console.log('Looking up image key:', key);
+
+    var res = await supabase.get(
+      '/rest/v1/workflow_content?content_key=eq.' + key +
+      '&is_active=eq.true&select=text_content,media_asset_id,media_assets(public_url)'
+    );
+    if (res.data && res.data[0]) {
+      var row = res.data[0];
+      if (row.media_assets && row.media_assets.public_url) return row.media_assets.public_url;
+      if (row.text_content) return row.text_content;
+    }
+
+    // Fallback: search media_assets by subcategory
+    var fallback = await supabase.get(
+      '/rest/v1/media_assets?subcategory=eq.' + eventType.toLowerCase() +
+      '&is_active=eq.true&file_type=eq.image&select=public_url&order=sort_order.asc&limit=1'
+    );
+    if (fallback.data && fallback.data[0]) return fallback.data[0].public_url;
+
+    return null;
+  } catch (e) {
+    console.error('getEventImage error:', e.message);
+    return null;
+  }
 }
 
-
-function parseGuestCount(val) {
-  if (!val) return null;
-  var s = String(val).toLowerCase().trim();
-  // Hindi word mappings
-  var hindiMap = {"एक सौ":100,"दो सौ":200,"तीन सौ":300,"चार सौ":400,"पांच सौ":500,"छह सौ":600,"सात सौ":700,"आठ सौ":800,"नौ सौ":900,"पचास":50,"सौ":100,"दो सौ पचास":250,"तीन सौ पचास":350};
-  for (var k in hindiMap) { if (s.indexOf(k) !== -1) return hindiMap[k]; }
-  if (s.indexOf("hundred") !== -1) { var m = s.match(/(d+)s*hundred/); return m ? parseInt(m[1])*100 : 100; }
-  var n = parseInt(s.replace(/[^0-9]/g,""));
-  return isNaN(n) ? null : n;
-}
 async function saveVoiceCall(data) {
   try {
     await supabase.post('/rest/v1/voice_calls', {
@@ -79,163 +105,233 @@ async function saveVoiceCall(data) {
       gathered_event_date: data.event_date || null,
       whatsapp_sent: false
     });
-    console.log('Voice call saved for ' + data.phone);
+    console.log('Voice call saved for', data.phone);
   } catch (err) {
     console.error('Supabase save error:', JSON.stringify(err.response ? err.response.data : err.message));
   }
 }
 
-async function updateLead(phone, eventType) {
+async function upsertLead(data) {
   try {
-    await supabase.patch('/rest/v1/leads?phone=eq.' + phone, {
-      event_type: eventType,
+    var existing = await supabase.get('/rest/v1/leads?phone=eq.' + data.phone + '&select=id,call_count');
+    var isNew = !existing.data || existing.data.length === 0;
+    var callCount = isNew ? 1 : ((existing.data[0].call_count || 0) + 1);
+
+    var payload = {
+      phone: data.phone,
+      updated_at: new Date().toISOString(),
+      last_interaction: new Date().toISOString(),
       voice_qualified: true,
       last_call_at: new Date().toISOString(),
-      updated_at: new Date().toISOString()
-    });
-    console.log('Lead updated for ' + phone);
+      call_count: callCount
+    };
+    if (data.name && data.name !== 'Guest') payload.name = data.name;
+    if (data.event_type) payload.event_type = data.event_type;
+    if (data.venue_name) payload.venue = data.venue_name;
+    if (data.guest_count) payload.guest_count = parseGuestCount(data.guest_count);
+    if (data.event_date) payload.event_date = data.event_date;
+
+    if (isNew) {
+      payload.source = 'voice_call';
+      payload.status = 'new';
+      await supabase.post('/rest/v1/leads', payload);
+      console.log('New lead created for', data.phone);
+    } else {
+      await supabase.patch('/rest/v1/leads?phone=eq.' + data.phone, payload);
+      console.log('Lead updated for', data.phone, '| call_count:', callCount);
+    }
   } catch (err) {
-    console.error('Lead update error:', JSON.stringify(err.response ? err.response.data : err.message));
+    console.error('upsertLead error:', JSON.stringify(err.response ? err.response.data : err.message));
   }
 }
 
 async function markWhatsAppSent(phone) {
   try {
-    await supabase.patch('/rest/v1/voice_calls?phone=eq.' + phone + '&whatsapp_sent=eq.false',
-      { whatsapp_sent: true, updated_at: new Date().toISOString() });
+    await supabase.patch(
+      '/rest/v1/voice_calls?phone=eq.' + phone + '&whatsapp_sent=eq.false',
+      { whatsapp_sent: true, updated_at: new Date().toISOString() }
+    );
   } catch (e) {}
 }
 
-// Extract lead data from transcript using simple keyword matching
+// ─────────────────────────────────────────────
+// PARSE GUEST COUNT
+// ─────────────────────────────────────────────
+function parseGuestCount(val) {
+  if (!val) return null;
+  var s = String(val).toLowerCase().trim();
+
+  var hindiMap = {
+    'एक सौ': 100, 'दो सौ': 200, 'तीन सौ': 300, 'चार सौ': 400,
+    'पांच सौ': 500, 'छह सौ': 600, 'सात सौ': 700, 'आठ सौ': 800,
+    'नौ सौ': 900, 'पचास': 50, 'सौ': 100, 'दो सौ पचास': 250,
+    'तीन सौ पचास': 350, 'डेढ़ सौ': 150
+  };
+  for (var k in hindiMap) {
+    if (s.indexOf(k) !== -1) return hindiMap[k];
+  }
+
+  var engMap = {
+    'twenty': 20, 'thirty': 30, 'forty': 40, 'fifty': 50,
+    'sixty': 60, 'seventy': 70, 'eighty': 80, 'ninety': 90,
+    'one hundred': 100, 'two hundred': 200, 'three hundred': 300,
+    'four hundred': 400, 'five hundred': 500, 'six hundred': 600,
+    'seven hundred': 700, 'eight hundred': 800, 'nine hundred': 900,
+    'hundred': 100, 'thousand': 1000
+  };
+  for (var ek in engMap) {
+    if (s.indexOf(ek) !== -1) return engMap[ek];
+  }
+
+  var n = parseInt(s.replace(/[^0-9]/g, ''));
+  return isNaN(n) ? null : n;
+}
+
+// ─────────────────────────────────────────────
+// EXTRACT FROM TRANSCRIPT
+// ─────────────────────────────────────────────
 function extractFromTranscript(transcript) {
   var data = { name: 'Guest', event_type: '', venue_booked: false, venue_name: '', guest_count: '', event_date: '' };
   if (!transcript) return data;
 
-  // Extract name - look for "मेरा नाम X है" or "I am X" or "my name is X"
   var nameMatch = transcript.match(/मेरा नाम ([^\n,।]+)/i) ||
                   transcript.match(/my name is ([^\n,।]+)/i) ||
-                  transcript.match(/I am ([^\n,।]+)/i);
+                  transcript.match(/naam hai ([^\n,।]+)/i);
   if (nameMatch) data.name = nameMatch[1].trim().split(' ')[0];
 
-  // Extract event type
-  var events = ['wedding', 'birthday', 'engagement', 'sangeet', 'haldi', 'mehendi', 'anniversary', 'corporate', 'शादी', 'जन्मदिन', 'सगाई'];
+  var events = ['wedding', 'birthday', 'engagement', 'sangeet', 'haldi', 'mehendi', 'anniversary', 'corporate', 'reception', 'शादी', 'जन्मदिन', 'सगाई'];
   for (var i = 0; i < events.length; i++) {
     if (transcript.toLowerCase().indexOf(events[i].toLowerCase()) !== -1) {
-      data.event_type = events[i];
+      data.event_type = events[i].charAt(0).toUpperCase() + events[i].slice(1);
       break;
     }
   }
 
-  // Extract venue booked status
-  if (transcript.indexOf('नहीं') !== -1 || transcript.toLowerCase().indexOf('no') !== -1) {
-    data.venue_booked = false;
-  }
-
-  // Extract guest count
-  var guestMatch = transcript.match(/(\d+)\s*guest/i) ||
-                   transcript.match(/(\d+)\s*मेहमान/i) ||
-                   transcript.match(/hundred/i);
-  if (guestMatch) {
-    data.guest_count = guestMatch[0].indexOf('hundred') !== -1 ? '100' : guestMatch[1];
-  }
+  var guestMatch = transcript.match(/(\d+)\s*guest/i) || transcript.match(/(\d+)\s*मेहमान/i);
+  if (guestMatch) data.guest_count = guestMatch[1];
 
   return data;
 }
 
+// ─────────────────────────────────────────────
+// MAIN WHATSAPP FLOW
+// ─────────────────────────────────────────────
 async function handleWhatsAppFlow(data) {
   console.log('Starting WA flow:', JSON.stringify(data));
 
-  // Step 1: Save to DB (never blocks WhatsApp)
+  // Step 1: DB (never blocks WhatsApp)
   try { await saveVoiceCall(data); } catch(e) { console.error('saveVoiceCall failed:', e.message); }
-  try { await updateLead(data.phone, data.event_type); } catch(e) { console.error('updateLead failed:', e.message); }
+  try { await upsertLead(data); } catch(e) { console.error('upsertLead failed:', e.message); }
 
-  // Step 2: WhatsApp message 1 - venue list or booking confirm
+  // Step 2: Message 1 — venue booked or venue list
   if (data.venue_booked === true || data.venue_booked === 'true') {
     await sendWhatsApp(data.phone,
-      '🎉 ' + data.name + ' ji!\n\nPhoenix Events mein aapka swagat hai!\n\n' +
-      '🎊 Event: ' + data.event_type + '\n' +
+      '🎉 ' + data.name + ' ji, Phoenix Events mein aapka swagat hai!\n\n' +
+      '🎊 Event: ' + (data.event_type || 'TBD') + '\n' +
       '🏛️ Venue: ' + (data.venue_name || 'Aapka selected venue') + '\n' +
       '👥 Guests: ' + (data.guest_count || 'TBD') + '\n' +
       '📅 Date: ' + (data.event_date || 'TBD') + '\n\n' +
-      'Hamara specialist 5 ghante mein aapko call karega!\n\n' +
+      'Hamara specialist 5 ghante mein aapko call karega! 🙏\n\n' +
       '🌐 phoenixeventsandproduction.com');
   } else {
     await sendWhatsApp(data.phone,
-      '🏛️ ' + data.name + ' ji!\n\nPhoenix Events ke saath aapki baat achi lagi! 😊\n\n' +
+      '🏛️ ' + data.name + ' ji, Phoenix Events ke saath baat karke achha laga! 😊\n\n' +
       'Hamare 7 premium partner venues Pimpri-Chinchwad mein:\n\n' +
       '1️⃣ Sky Blue Banquet Hall — Ravet ⭐4.7\n' +
       '2️⃣ Thopate Banquets — Rahatani\n' +
       '3️⃣ Blue Water Banquet Hall — Punawale ⭐5.0\n' +
       '4️⃣ RamKrishna Veg Banquet — Ravet ⭐4.4\n' +
-      '5️⃣ Shree Krishna Palace — Pimpri ⭐4.3\n' +
+      '5️⃣ Shree Krishna Palace — Pimpri Colony ⭐4.3\n' +
       '6️⃣ Raghunandan AC Banquet — Tathawade ⭐4.0\n' +
       '7️⃣ Rangoli Banquet Hall — Chinchwad ⭐4.3\n\n' +
-      'Inme se koi pasand aaye toh batao! 🎊\n\n' +
+      'Koi bhi venue pasand aaye toh hume batao! 🎊\n\n' +
       '🌐 phoenixeventsandproduction.com');
   }
 
-  // Step 3: Event image (optional)
+  // Step 3: Event image from dashboard (optional)
   try {
     if (data.event_type) {
       var imageUrl = await getEventImage(data.event_type);
       if (imageUrl) {
         await sendWhatsAppImage(data.phone, imageUrl,
-          data.event_type + ' ke liye hamare kaam ki jhalak!');
+          '✨ ' + data.event_type + ' ke liye hamare kaam ki jhalak!');
+      } else {
+        console.log('No image configured for:', data.event_type);
       }
     }
-  } catch(e) { console.error('Image failed:', e.message); }
+  } catch(e) { console.error('Image step failed:', e.message); }
 
-  // Step 4: Summary message
+  // Step 4: Summary
   await sendWhatsApp(data.phone,
-    '✨ ' + data.name + ' ji, yeh rahi aapki details:\n\n' +
+    '📋 Aapki details humne note kar li hain:\n\n' +
     '🎊 Event: ' + (data.event_type || 'TBD') + '\n' +
     '👥 Guests: ' + (data.guest_count || 'TBD') + '\n' +
     '📅 Date: ' + (data.event_date || 'TBD') + '\n\n' +
     'Hamara specialist 5 ghante mein aapko call karega! 🎉\n\n' +
+    'Koi sawaal ho toh yahan message kar sakte hain.\n' +
     '🌐 phoenixeventsandproduction.com');
 
-  // Step 5: Mark sent
   try { await markWhatsAppSent(data.phone); } catch(e) {}
-
-  console.log('WA flow complete for ' + data.phone);
+  console.log('WA flow complete for', data.phone);
 }
 
+// ─────────────────────────────────────────────
+// ROUTES
+// ─────────────────────────────────────────────
 app.get('/', function(req, res) {
-  res.json({ status: 'Phoenix Events Webhook Server is running! VERSION 4' });
+  res.json({ status: 'Phoenix Events Webhook VERSION 5', timestamp: new Date().toISOString() });
 });
 
 app.post('/phoenix-bolna-agent', async function(req, res) {
   console.log('=== NEW REQUEST ===');
-
   var body = req.body;
-  if (typeof body === 'string') {
-    try { body = JSON.parse(body); } catch(e) {}
+  if (typeof body === 'string') { try { body = JSON.parse(body); } catch(e) {} }
+
+  var status = body && body.status;
+  var userNumber = body && body.user_number;
+  console.log('Status:', status, '| User:', userNumber);
+
+  var toolName = body && (body.name || body.tool_name ||
+    (body.tool_call && body.tool_call.name) ||
+    (body.function && body.function.name) ||
+    (body.task && body.task.name)) || '';
+
+  // ── CASE 0: Returning caller lookup (initiated status OR get_lead_data tool) ──
+  if (toolName === 'get_lead_data' || (status === 'initiated' && userNumber)) {
+    var lookupPhone = (userNumber || '').replace('+', '').replace(/\s/g, '');
+    console.log('Looking up lead for:', lookupPhone);
+    var lead = await getLeadByPhone(lookupPhone);
+    if (lead) {
+      console.log('Returning caller:', lead.name, '| event:', lead.event_type, '| calls:', lead.call_count);
+      return res.json({
+        result: 'returning_caller',
+        is_returning: true,
+        name: lead.name || '',
+        event_type: lead.event_type || '',
+        venue: lead.venue || '',
+        guest_count: lead.guest_count || '',
+        event_date: lead.event_date || '',
+        call_count: lead.call_count || 0
+      });
+    }
+    return res.json({ result: 'new_caller', is_returning: false });
   }
 
-  console.log('Status:', body && body.status);
-  console.log('User number:', body && body.user_number);
-
-  // ── CASE 1: Completed call from Analytics webhook ──
-  if (body && body.status === 'completed' && body.user_number) {
-    var phone = body.user_number.replace('+', '').replace(/\s/g, '');
+  // ── CASE 1: Completed call ──
+  if (status === 'completed' && userNumber) {
+    var phone = userNumber.replace('+', '').replace(/\s/g, '');
     var transcript = body.transcript || '';
+    console.log('COMPLETED CALL for:', phone);
 
-    console.log('COMPLETED CALL detected for phone:', phone);
-
-    // Extract data from transcript
     var extracted = extractFromTranscript(transcript);
-
-    // Try custom_extractions first if available
     var extractions = body.custom_extractions || body.extracted_data || null;
     if (extractions && typeof extractions === 'object') {
-      extracted.name = extractions.customer_name || extracted.name;
-      extracted.event_type = extractions.event_type || extracted.event_type;
-      extracted.venue_booked = extractions.venue_booked || extracted.venue_booked;
-      var vn = extractions.venue_name;
-      extracted.venue_name = (vn && typeof vn === 'string') ? vn : extracted.venue_name;
-      extracted.guest_count = extractions.guest_count || extracted.guest_count;
-      var ed = extractions.event_date;
-      extracted.event_date = (ed && typeof ed === 'string') ? ed : extracted.event_date;
+      if (extractions.customer_name) extracted.name = extractions.customer_name;
+      if (extractions.event_type) extracted.event_type = extractions.event_type;
+      if (extractions.venue_booked !== undefined) extracted.venue_booked = extractions.venue_booked;
+      if (extractions.venue_name && typeof extractions.venue_name === 'string') extracted.venue_name = extractions.venue_name;
+      if (extractions.guest_count) extracted.guest_count = extractions.guest_count;
+      if (extractions.event_date && typeof extractions.event_date === 'string') extracted.event_date = extractions.event_date;
     }
 
     var data = {
@@ -254,27 +350,13 @@ app.post('/phoenix-bolna-agent', async function(req, res) {
     return;
   }
 
-  // ── CASE 2: Direct tool call save_lead_data ──
-  var toolName = '';
-  if (body) {
-    toolName = body.name || body.tool_name ||
-      (body.tool_call && body.tool_call.name) ||
-      (body.function && body.function.name) ||
-      (body.task && body.task.name) || '';
-  }
-  // Bolna sends tool args at top level or nested
-  var args = body && (body.arguments || body.parameters || body.data || body.input) ? 
-    (body.arguments || body.parameters || body.data || body.input) : body;
-  var phone = body && (body.phone || body.from_number || body.user_number ||
-    (body.call && body.call.customer && body.call.customer.number)) || '';
-  phone = phone.replace('+', '').replace(/\s/g, '');
-  
-  console.log('Tool name detected:', toolName);
-  console.log('Args keys:', Object.keys(args || {}));
+  // ── CASE 2: save_lead_data tool ──
+  var args = body && (body.arguments || body.parameters || body.data || body.input) || body;
+  var toolPhone = ((body && (body.phone || body.from_number || body.user_number)) || '').replace('+', '').replace(/\s/g, '');
 
   if (toolName === 'save_lead_data' || (args && args.event_type && args.name)) {
-    var data = {
-      phone: phone || (args && args.phone) || '',
+    var toolData = {
+      phone: toolPhone || (args && args.phone) || '',
       name: (args && args.name) || 'Guest',
       event_type: (args && args.event_type) || '',
       venue_booked: (args && args.venue_booked) || false,
@@ -282,18 +364,20 @@ app.post('/phoenix-bolna-agent', async function(req, res) {
       guest_count: (args && args.guest_count) || '',
       event_date: (args && args.event_date) || ''
     };
-    console.log('TOOL CALL save_lead_data:', JSON.stringify(data));
-    res.json({ result: 'Lead saved. Sending WhatsApp now!' });
-    handleWhatsAppFlow(data).catch(function(e) { console.error('Flow error:', e); });
+    console.log('TOOL save_lead_data:', JSON.stringify(toolData));
+    res.json({ result: 'Lead saved! WhatsApp message is being sent.' });
+    handleWhatsAppFlow(toolData).catch(function(e) { console.error('Flow error:', e); });
     return;
   }
 
-  // ── CASE 3: get_venue_list ──
+  // ── CASE 3: get_venue_list tool ──
   if (toolName === 'get_venue_list') {
-    return res.json({ result: 'Sky Blue Banquet Ravet 4.7, Thopate Banquets Rahatani, Blue Water Punawale 5.0, RamKrishna Veg Ravet 4.4, Shree Krishna Pimpri 4.3, Raghunandan Tathawade 4.0, Rangoli Chinchwad 4.3 - all Pimpri-Chinchwad Pune.' });
+    return res.json({
+      result: 'Hamare 7 partner venues: 1) Sky Blue Banquet Hall - Ravet (4.7) 2) Thopate Banquets - Rahatani 3) Blue Water Banquet - Punawale (5.0) 4) RamKrishna Veg Banquet - Ravet (4.4) 5) Shree Krishna Palace - Pimpri (4.3) 6) Raghunandan AC Banquet - Tathawade (4.0) 7) Rangoli Banquet Hall - Chinchwad (4.3). Sab Pimpri-Chinchwad Pune mein hain.'
+    });
   }
 
-  console.log('⚠️ UNHANDLED - status:', body && body.status, '| keys:', Object.keys(body || {}));
+  // All other statuses — ignore silently
   res.json({ status: 'received' });
 });
 
@@ -303,5 +387,5 @@ app.get('/phoenix-bolna-agent', function(req, res) {
 
 var PORT = process.env.PORT || 8080;
 app.listen(PORT, function() {
-  console.log('Phoenix Webhook Server running on port ' + PORT);
+  console.log('Phoenix Webhook Server VERSION 5 running on port ' + PORT);
 });

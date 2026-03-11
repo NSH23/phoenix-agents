@@ -11,7 +11,7 @@ const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const WA_TOKEN = process.env.WA_TOKEN;
 const WA_PHONE_ID = process.env.WA_PHONE_ID || '1023140200877702';
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'phoenix_verify_2024';
-const GEMINI_KEY = process.env.GEMINI_API_KEY;
+const GROQ_KEY = process.env.GROQ_API_KEY;
 
 const supabase = axios.create({
   baseURL: SUPABASE_URL,
@@ -362,45 +362,32 @@ Remember: You are having a REAL conversation. Be human. Be warm. Make them feel 
   // Add current message
   messages.push({ role: 'user', content: userMessage });
 
-  // Build Gemini contents array
-  var geminiContents = [
-    { role: 'user', parts: [{ text: systemPrompt }] },
-    { role: 'model', parts: [{ text: 'Samajh gaya! Main Aishwarya hoon, Phoenix Events ki WhatsApp assistant. Main aapki madad karne ke liye taiyaar hoon.' }] }
-  ];
-
-  // Add conversation history
-  messages.slice(0, -1).forEach(function(m) {
-    geminiContents.push({
-      role: m.role === 'user' ? 'user' : 'model',
-      parts: [{ text: m.content }]
-    });
-  });
-
-  // Add current user message
-  geminiContents.push({ role: 'user', parts: [{ text: userMessage }] });
+  // Add current message to messages array
+  messages.push({ role: 'user', content: userMessage });
 
   try {
     var response = await axios.post(
-      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=' + GEMINI_KEY,
+      'https://api.groq.com/openai/v1/chat/completions',
       {
-        contents: geminiContents,
-        generationConfig: { maxOutputTokens: 1000, temperature: 0.7 },
-        safetySettings: [
-          { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
-          { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
-          { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
-          { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' }
-        ]
+        model: 'llama-3.3-70b-versatile',
+        max_tokens: 1000,
+        temperature: 0.7,
+        messages: [{ role: 'system', content: systemPrompt }].concat(messages)
       },
-      { headers: { 'Content-Type': 'application/json' } }
+      {
+        headers: {
+          'Authorization': 'Bearer ' + GROQ_KEY,
+          'Content-Type': 'application/json'
+        }
+      }
     );
 
-    var fullText = response.data.candidates[0].content.parts[0].text;
-    console.log('Gemini response:', fullText.substring(0, 200));
+    var fullText = response.data.choices[0].message.content;
+    console.log('Groq response:', fullText.substring(0, 200));
     return fullText;
 
   } catch (err) {
-    console.error('Gemini API error:', JSON.stringify(err.response ? err.response.data : err.message));
+    console.error('Groq API error:', JSON.stringify(err.response ? err.response.data : err.message));
     return 'Ek second, kuch technical issue aa gaya. Kripya thodi der baad try karein. 🙏';
   }
 }

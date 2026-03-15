@@ -3,7 +3,7 @@ const axios = require('axios');
 const app = express();
 app.use(express.json());
 
-const SUPABASE_URL = 'https://fhhwfqlbgmsscmqihjyz.supabase.co';
+const SUPABASE_URL = 'https://qjxqebtxhfwaufmccewj.supabase.co';
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const WA_TOKEN = process.env.WA_TOKEN;
 const WA_PHONE_ID = process.env.WA_PHONE_ID || '1023140200877702';
@@ -199,82 +199,77 @@ function cleanAiTags(text) {
   return text.replace(/\[LEAD:[^\]]+\]/g, '').replace(/\[SEND:[^\]]+\]/g, '').trim();
 }
 
-// ── DETECT LANGUAGE FROM MESSAGE ──
-function detectLanguage(text) {
-  if (!text) return 'hinglish';
-  var marathiChars = (text.match(/[\u0900-\u097F]/g) || []).length;
-  if (marathiChars > 3) return 'marathi_devanagari';
-  var hindiWords = ['kya', 'hai', 'hoon', 'aap', 'main', 'mera', 'meri', 'nahi', 'bahut', 'acha', 'karo', 'karo', 'chahiye', 'plan', 'kar', 'raha', 'rahi'];
-  var englishWords = ['the', 'is', 'are', 'what', 'how', 'when', 'where', 'want', 'need', 'have', 'plan', 'event'];
-  var lc = text.toLowerCase();
-  var hindiCount = hindiWords.filter(function(w) { return lc.indexOf(w) !== -1; }).length;
-  var engCount = englishWords.filter(function(w) { return lc.indexOf(w) !== -1; }).length;
-  if (engCount > hindiCount + 2) return 'english';
-  return 'hinglish';
-}
 
 // ── CALL GROQ AI ──
 async function callGroq(phone, userMessage, lead, history, knowledgeBase) {
   var kb = buildKnowledgeContext(knowledgeBase);
-  var lang = detectLanguage(userMessage);
 
-  var leadContext = '';
+  // Build what we already know about this lead
+  var alreadyKnow = [];
+  var missing = [];
   if (lead) {
     var hasName = lead.name && lead.name !== 'Friend' && lead.name !== 'Guest' && lead.name !== 'Unknown';
-    var hasEvent = lead.event_type && lead.event_type !== 'Unknown';
-    var alreadyKnow = [];
-    if (hasName) alreadyKnow.push('naam: ' + lead.name);
-    if (hasEvent) alreadyKnow.push('event: ' + lead.event_type);
-    if (lead.venue) alreadyKnow.push('venue: ' + lead.venue);
-    if (lead.guest_count) alreadyKnow.push('guests: ' + lead.guest_count);
-    if (lead.event_date) alreadyKnow.push('date: ' + lead.event_date);
-    if (lead.package_type) alreadyKnow.push('package: ' + lead.package_type);
-    if (lead.services_needed) alreadyKnow.push('services: ' + lead.services_needed);
-    if (lead.email) alreadyKnow.push('email: ' + lead.email);
-    if (lead.preferred_call_time) alreadyKnow.push('call_time: ' + lead.preferred_call_time);
-
-    leadContext = 'RETURNING CUSTOMER — naam se warmly greet karo.\n\n' +
-      'Pehle se pata hai: ' + (alreadyKnow.length ? alreadyKnow.join(', ') : 'kuch nahi') + '\n' +
-      'Calls: ' + (lead.call_count || 0) + ' | WA messages: ' + (lead.whatsapp_count || 0) + '\n' +
-      'Voice call hua: ' + (lead.call_count > 0 ? 'haan — voice agent ne major questions pooche hain' : 'nahi — WP agent pehli baar baat kar raha hai') + '\n\n' +
-      'JO PEHLE SE PATA HAI WOH MAT POOCHO — sirf jo missing hai woh collect karo.\n' +
-      'Missing fields: ' +
-      (!hasName ? 'naam, ' : '') +
-      (!hasEvent ? 'event type, ' : '') +
-      (!lead.guest_count ? 'guest count, ' : '') +
-      (!lead.event_date ? 'event date, ' : '') +
-      (!lead.venue ? 'venue preference, ' : '') +
-      (!lead.package_type ? 'package type, ' : '') +
-      (!lead.services_needed ? 'services needed, ' : '') +
-      (!lead.email ? 'email, ' : '') +
-      'aur baaki kuch jo user ne nahi bataya';
-  } else {
-    leadContext = 'NEW CUSTOMER — pehli baar baat ho rahi hai.\nSabhi major questions poochne hain — naam, event, date, guests, venue, package, services.';
+    if (hasName) alreadyKnow.push('Naam: ' + lead.name); else missing.push('naam');
+    if (lead.event_type) alreadyKnow.push('Event: ' + lead.event_type); else missing.push('event type');
+    if (lead.event_date) alreadyKnow.push('Event date: ' + lead.event_date); else missing.push('event date');
+    if (lead.guest_count) alreadyKnow.push('Guests: ' + lead.guest_count); else missing.push('guest count');
+    if (lead.venue) alreadyKnow.push('Venue: ' + lead.venue); else missing.push('venue preference');
+    if (lead.package_type) alreadyKnow.push('Package: ' + lead.package_type); else missing.push('package type');
+    if (lead.services_needed) alreadyKnow.push('Services: ' + lead.services_needed); else missing.push('services needed');
+    if (lead.city) alreadyKnow.push('City: ' + lead.city);
+    if (lead.preferred_call_time) alreadyKnow.push('Preferred call time: ' + lead.preferred_call_time);
+    if (lead.email) alreadyKnow.push('Email: ' + lead.email);
+    if (lead.callback_date) alreadyKnow.push('Callback scheduled: ' + lead.callback_date);
   }
 
-  var langInstruction = '';
-  if (lang === 'english') {
-    langInstruction = 'User English mein likh raha hai — English mein reply karo. Warm aur friendly English use karo.';
-  } else if (lang === 'marathi_devanagari') {
-    langInstruction = 'User Marathi (Devanagari script) mein likh raha hai — Marathi mein reply karo. Devanagari script use karo Marathi ke liye.';
-  } else {
-    langInstruction = 'User Hinglish mein likh raha hai — Hinglish mein reply karo (Hindi words, Roman script). Jaise: "kya plan kar rahe ho", "kitne log aa rahe hain". Pure Hindi mat likho, pure English mat likho.';
+  // Voice call context — this is the magic for continuity
+  var voiceContext = '';
+  if (lead && lead.call_count > 0) {
+    voiceContext = '\n\nVOICE CALL CONTEXT (BAHUT IMPORTANT):\n';
+    voiceContext += 'Is user se pehle ek voice call hua hai Aishwarya ke saath. ';
+    voiceContext += 'Ab user WhatsApp pe message kar raha/rahi hai — SAME Aishwarya ho tum, conversation continue ho rahi hai.\n';
+    if (lead.call_summary && lead.call_summary.trim()) {
+      voiceContext += 'Call ka summary: ' + lead.call_summary + '\n';
+    }
+    if (lead.last_voice_transcript && lead.last_voice_transcript.trim()) {
+      var shortTranscript = lead.last_voice_transcript.substring(0, 800);
+      voiceContext += 'Call transcript (partial): ' + shortTranscript + '\n';
+    }
+    voiceContext += '\nCall ka natural continuation karo:\n';
+    voiceContext += '- Call mein jo baat hui usका reference de — "call pe jo baat hui thi", "jaise aapne bataya tha"\n';
+    voiceContext += '- Jo data call pe collect hua woh DOBARA mat maango\n';
+    voiceContext += '- Sirf jo baaki missing hai woh naturally poocho\n';
+    voiceContext += '- Feel aana chahiye ki same Aishwarya hai jo call pe thi\n';
+  } else if (lead && lead.whatsapp_count > 0) {
+    voiceContext = '\n\nRETURNING WA USER: Pehle WhatsApp pe baat ho chuki hai. Warmly continue karo.';
   }
+
+  var leadContext = lead
+    ? 'CUSTOMER KE BAARE MEIN JO PATA HAI:\n' + (alreadyKnow.length ? alreadyKnow.join('\n') : 'Kuch nahi pata abhi') +
+      '\n\nJO ABHI BAAKI HAI COLLECT KARNA:\n' + (missing.length ? missing.join(', ') : 'Sab data mil gaya!') +
+      '\n\nJO PEHLE SE PATA HAI WOH BILKUL MAT POOCHO — sirf missing fields collect karo ek-ek karke.' + voiceContext
+    : 'NAYA CUSTOMER — pehli baar baat ho rahi hai.\nSabhi major questions ek-ek karke poochne hain: naam, event, date, guests, venue, package, services.';
 
   var systemPrompt = 'Tu Aishwarya hai — Phoenix Events & Production ki WhatsApp assistant, Pimpri-Chinchwad, Pune se.\n\n' +
-    'Tu ek warm, soft-spoken, polite aur friendly Maharashtrian ladki hai. Real insaan ki tarah baat kar — kabhi robotic mat lag.\n\n' +
 
-    'LANGUAGE:\n' + langInstruction + '\n' +
-    'HAMESHA female words use kar: bataungi, karungi, bhejungi, hoon, rahi hoon — kabhi bataunga/karunga mat likhna.\n\n' +
+    'HAMESHA SIRF HINDI MEIN BAAT KAR — chahe user kuch bhi bheje.\n' +
+    'Hindi Devanagari ya Hinglish (Hindi words, Roman script) use kar — lekin KABHI bhi English ya Marathi mein reply mat kar.\n' +
+    'Agar user English mein likhe, toh bhi Hindi mein jawab de — "Bilkul! Main batati hoon..." ki tarah.\n' +
+    'Agar user Marathi mein likhe, toh bhi Hindi mein jawab de — "Haan zaroor..." ki tarah.\n\n' +
 
-    'GENDER DETECT: Naam se gender samajhne ki koshish kar aur accordingly baat kar.\n\n' +
+    'PERSONALITY:\n' +
+    '- Fun, bubbly, warm — jaise ek helpful saheli jo genuinely events ke liye excited hoti hai\n' +
+    '- Real insaan ki tarah baat kar — kabhi robotic mat lag\n' +
+    '- Hamesha apne liye female words use kar: bataungi, karungi, hoon, rahi hoon — kabhi bataunga/karunga mat likhna\n' +
+    '- User ko "aap" se address kar\n' +
+    '- Choti natural reactions theek hain: "Wah!", "Ooh nice!", "Acha!" — par sirf jab genuinely fit ho\n\n' +
 
     'RESPONSE STYLE:\n' +
-    '- 2-3 lines max — na zyada lamba, na sirf ek liner\n' +
+    '- 2-3 lines max — short, warm, conversational\n' +
     '- Ek hi sawaal ek response mein\n' +
-    '- *bold* important cheezein — venue names, dates, amounts\n' +
+    '- *bold* important cheezein — venue names, dates\n' +
     '- Emojis natural jagah use kar\n' +
-    '- Short, warm, conversational — paragraph mat likho\n\n' +
+    '- Paragraph mat likho — crisp rakho\n\n' +
 
     'CUSTOMER STATUS:\n' + leadContext + '\n\n' +
 
@@ -296,74 +291,39 @@ async function callGroq(phone, userMessage, lead, history, knowledgeBase) {
     '7. Rangoli Banquet Hall — Chinchwad ⭐4.3 | 100-500 guests\n\n' +
 
     'CONVERSATION FLOW (jo already pata hai woh SKIP karo):\n' +
-    '1. Greet (returning = naam se, new = fresh greeting)\n' +
-    '2. Naam (agar nahi pata)\n' +
-    '3. Event type (agar nahi pata) → turant related portfolio image bhejo\n' +
-    '4. Relationship to event (smartly based on event type)\n' +
-    '5. Event date (agar nahi pata)\n' +
-    '6. Guest count (agar nahi pata)\n' +
-    '7. Venue (agar nahi pata) → suggest hamara venues, images bhejo\n' +
-    '8. Services — pehle services batao, phir poocho konsi chahiye\n' +
-    '9. Package type (smart question — simple/standard/premium/luxury)\n' +
-    '10. Theme/vibe preference\n' +
-    '11. Indoor/Outdoor\n' +
-    '12. Associated functions (wedding=mehendi/haldi/sangeet, birthday=dj/return gifts)\n' +
-    '13. Preferred call time\n' +
-    '14. Email ID\n' +
-    '15. Summary offer + specialist CTA\n\n' +
+    '1. Naam (agar nahi pata)\n' +
+    '2. Event type → turant related portfolio image bhejo\n' +
+    '3. Event date\n' +
+    '4. Guest count\n' +
+    '5. Venue (suggest hamare venues, images bhejo)\n' +
+    '6. Services — pehle options batao, phir poocho\n' +
+    '7. Package type (simple/standard/premium/luxury)\n' +
+    '8. Preferred callback time → specialist ke liye\n' +
+    '9. Summary + specialist CTA\n\n' +
 
-    'SERVICES BY EVENT:\n' +
-    'Wedding: Stage & Mandap Decoration, Floral Decoration, Lighting & LED, Photography, Videography, DJ & Sound, Entry Gate Setup, Photo Booth, Return Gift Coordination, Full Planning\n' +
-    'Birthday: Theme Setup, Balloon & Floral Decoration, Cake Table, Photo Booth, DJ & Sound, Return Gifts, Entry Decoration\n' +
-    'Corporate: Stage & Backdrop, Branding & Signage, AV Setup, Lighting, Full Event Management\n\n' +
-
-    'SMART BUDGET QUESTION (kabhi direct price mat poocho):\n' +
-    '"Aap kaisa event imagine kar rahe ho — simple aur elegant, standard, premium ya full luxury?"\n' +
-    'Map internally: simple=low, standard=medium, premium=high, luxury=very high\n' +
-    'Pricing negotiations → ALWAYS specialist ke paas bhejo\n\n' +
-
-    'CATERING:\n' +
-    '"Catering abhi hum directly provide nahi karte, lekin hamare specialist aapke liye best option dhundhenge!"\n\n' +
-
-    'IMAGES — CRITICAL:\n' +
-    '- Tu photos bhej sakti hai — [SEND:image=key] tag use kar\n' +
-    '- Kabhi mat bolo "main photos nahi bhej sakti"\n' +
-    '- Event images: [SEND:image=event_wedding_image], [SEND:image=event_birthday_image], etc.\n' +
-    '- Venue images: [SEND:image=venue_1_image] through [SEND:image=venue_7_image]\n' +
+    'IMAGES — ZAROOR BHEJO:\n' +
+    '- [SEND:image=event_wedding_image], [SEND:image=event_birthday_image], etc.\n' +
+    '- [SEND:image=venue_1_image] through [SEND:image=venue_7_image]\n' +
     '- Jab bhi event ya venue discuss ho → relevant image bhejo\n\n' +
-
-    'HANDOFF FROM VOICE (agar lead ka call_count > 0 hai):\n' +
-    'Voice agent ne pehle se major data collect kiya hai. WP agent ka role:\n' +
-    '- Warmly welcome karo — "Voice pe baat ho gayi, main Aishwarya WhatsApp pe bhi hoon!"\n' +
-    '- Remaining/missing questions poocho\n' +
-    '- Photos aur media share karo\n' +
-    '- Summary bhejo\n\n' +
 
     'STRICT RULES:\n' +
     '- Sirf Phoenix Events related topics pe baat karo\n' +
     '- Off-topic: "Main sirf Phoenix Events ke baare mein help kar sakti hoon 😊"\n' +
-    '- Disrespect (bad language/rude): "Yeh conversation record ho rahi hai. Kripya respectfully baat karein."\n' +
-    '- Agar continues: "Is conversation ko yahan rok rahi hoon. Phoenix Events ke liye dobara message kar sakte hain."\n' +
-    '- Price kabhi mat batao — specialist ko bhejo\n\n' +
+    '- Price kabhi mat batao — "Exact pricing ke liye hamare specialist se baat karein"\n' +
+    '- Disrespect: ek baar warn karo, dobara ho toh conversation khatam karo\n\n' +
 
-    'DETAILS CONFIRMATION (jab naam+event+date ya guests pata ho):\n' +
-    'Ek baar summary offer karo: "Kya aap chahenge ki main ek chhoti summary bhejun — kya save hua hai?"\n' +
-    'Agar yes:\n' +
-    '"✅ *Aapki saved details:*\n[relevant fields only]\n\nKuch change karna ho toh bas batao! 😊"\n' +
-    'Phir: "Hamare specialist *aaj hi* call karenge! 🙏\n📞 *+91 80357 35856*\n🌐 phoenixeventsandproduction.com"\n\n' +
+    'CALLBACK SCHEDULING:\n' +
+    '"Kya main specialist ka callback schedule kar doon? Woh jald hi call karenge!\n' +
+    'Kaunsa time suit karega — morning, afternoon ya evening?"\n' +
+    '[LEAD:status=callback_scheduled] [LEAD:call_time=evening]\n\n' +
 
     'DATA COLLECTION TAGS (message ke BILKUL END mein — user ko nahi dikhte):\n' +
     '[LEAD:name=Rahul] [LEAD:event_type=Wedding] [LEAD:venue=Sky Blue Banquet Hall]\n' +
     '[LEAD:guest_count=200] [LEAD:event_date=15/06/2026] [LEAD:package_type=premium]\n' +
     '[LEAD:services=decoration,photography] [LEAD:theme=Royal] [LEAD:indoor_outdoor=indoor]\n' +
-    '[LEAD:email=rahul@gmail.com] [LEAD:city=Pimpri-Chinchwad] [LEAD:source=instagram]\n' +
-    '[LEAD:functions=mehendi,sangeet,haldi] [LEAD:relationship=self]\n' +
-    '[LEAD:call_time=evening] [LEAD:instagram=@rahul_ig]\n' +
-    '[LEAD:status=qualified] [LEAD:score+5] [LEAD:score+3] [LEAD:score+1]\n\n' +
-    'CALLBACK SCHEDULING:\n' +
-    '"Kya main specialist ka callback schedule kar doon? 😊 Woh *aaj hi* call karenge!\n' +
-    'Kaunsa time suit karega — morning, afternoon ya evening?"\n' +
-    'Date+time collect karo → [LEAD:status=callback_scheduled] [LEAD:call_time=evening]';
+    '[LEAD:email=rahul@gmail.com] [LEAD:city=Pimpri-Chinchwad]\n' +
+    '[LEAD:functions=mehendi,sangeet] [LEAD:relationship=self] [LEAD:call_time=evening]\n' +
+    '[LEAD:status=qualified] [LEAD:score+5]';
 
   var messages = [];
   history.forEach(function(h) {
@@ -373,7 +333,7 @@ async function callGroq(phone, userMessage, lead, history, knowledgeBase) {
 
   try {
     var response = await axios.post('https://api.groq.com/openai/v1/chat/completions',
-      { model: 'llama-3.3-70b-versatile', max_tokens: 600, temperature: 0.6, messages: [{ role: 'system', content: systemPrompt }].concat(messages) },
+      { model: 'llama-3.3-70b-versatile', max_tokens: 300, temperature: 0.5, messages: [{ role: 'system', content: systemPrompt }].concat(messages) },
       { headers: { 'Authorization': 'Bearer ' + GROQ_KEY, 'Content-Type': 'application/json' } }
     );
     var fullText = response.data.choices[0].message.content;
@@ -469,8 +429,8 @@ app.post('/whatsapp', async function(req, res) {
 });
 
 app.get('/', function(req, res) {
-  res.json({ status: 'Phoenix WhatsApp AI Agent VERSION 3', timestamp: new Date().toISOString() });
+  res.json({ status: 'Phoenix WhatsApp AI Agent VERSION 4', timestamp: new Date().toISOString() });
 });
 
 var PORT = process.env.PORT || 3000;
-app.listen(PORT, function() { console.log('Phoenix WhatsApp AI Agent VERSION 3 running on port ' + PORT); });
+app.listen(PORT, function() { console.log('Phoenix WhatsApp AI Agent VERSION 4 running on port ' + PORT); });

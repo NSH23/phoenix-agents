@@ -4,8 +4,8 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-const SUPABASE_URL = 'https://fhhwfqlbgmsscmqihjyz.supabase.co';
-const SUPABASE_KEY = process.env.SUPABASE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZoaHdmcWxiZ21zc2NtcWloanl6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzE0MzgwNTksImV4cCI6MjA4NzAxNDA1OX0.T1n19S4_D7eNX4bz9AovBXwKrwOjGxvrzFGpO4nNxJ4';
+const SUPABASE_URL = 'https://qjxqebtxhfwaufmccewj.supabase.co';
+const SUPABASE_KEY = process.env.SUPABASE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFqeHFlYnR4aGZ3YXVmbWNjZXdqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM1NzUyMzQsImV4cCI6MjA4OTE1MTIzNH0.XdS-G7J2qbMEKj3lvdba0jnTDV0K1AnXe0JBym8qPKA';
 const WA_TOKEN = process.env.WA_TOKEN;
 const WA_PHONE_ID = process.env.WA_PHONE_ID || '1023140200877702';
 
@@ -173,6 +173,9 @@ async function upsertLead(data) {
     if (data.catering_needed !== undefined && data.catering_needed !== '') {
       payload.catering_needed = data.catering_needed === 'true' || data.catering_needed === true;
     }
+    // Save call summary and transcript so WA agent can continue the conversation naturally
+    if (data._callSummary) payload.call_summary = data._callSummary;
+    if (data._callTranscript) payload.last_voice_transcript = data._callTranscript.substring(0, 3000);
 
     if (data.event_date) {
       try {
@@ -237,14 +240,14 @@ async function handleHandoffFlow(data) {
   var ev = data.event_type || '';
   var venue = data.venue_name || '';
 
-  // 1. Warm greeting
-  var greeting = 'Heyy *' + name + '* ji! 😊 Main Aishwarya hoon Phoenix Events se — abhi aapsi baat hui!\n\n';
+  // 1. Warm greeting referencing the call
+  var greeting = '*' + name + '* ji! 😊 Main Aishwarya hoon — Phoenix Events se.\n\n';
   if (ev && venue) {
-    greeting += 'Aapke *' + ev + '* event aur *' + venue + '* ke liye kuch khoobsurat cheezein laayi hoon! ✨\n\nAbhi photos bhej rahi hoon... 📸';
+    greeting += 'Abhi call pe *' + ev + '* aur *' + venue + '* ke baare mein baat hui — kuch khoobsurat cheezein share karna chahti thi! ✨';
   } else if (ev) {
-    greeting += 'Aapke *' + ev + '* ke liye kuch beautiful photos laayi hoon! ✨\n\nAbhi bhej rahi hoon... 📸';
+    greeting += 'Abhi call pe *' + ev + '* ke baare mein baat hui — hamare kuch beautiful kaam ki jhalak bhejti hoon! ✨';
   } else {
-    greeting += 'Phoenix Events ke kuch khoobsurat kaam ki jhalak bhejti hoon! ✨';
+    greeting += 'Call ke baad WhatsApp pe bhi aa gayi — yahan bhi available hoon! 😊 Phoenix Events ke kuch kaam ki jhalak bhejti hoon ✨';
   }
   await sendWhatsApp(data.phone, greeting);
   await sleep(1500);
@@ -281,16 +284,16 @@ async function handleHandoffFlow(data) {
   }
 
   // 5. Details summary + specialist CTA
-  var d = '✅ *Aapki details save kar li hain!*\n\n';
+  var d = '✅ *Call mein jo baat hui, woh save kar li hai:*\n\n';
   if (ev) d += '🎊 *Event:* ' + ev + '\n';
   if (data.guest_count) d += '👥 *Guests:* ' + data.guest_count + '\n';
   if (data.event_date) d += '📅 *Date:* ' + data.event_date + '\n';
   if (venue) d += '🏛️ *Venue:* ' + venue + '\n';
   if (data.services_needed) d += '✨ *Services:* ' + data.services_needed + '\n';
   if (data.package_type) d += '📦 *Package:* ' + data.package_type.charAt(0).toUpperCase() + data.package_type.slice(1) + '\n';
-  if (data.preferred_call_time) d += '📞 *Preferred call time:* ' + data.preferred_call_time + '\n';
-  d += '\nHamare specialist *aaj hi* aapko call karenge! 🙏\n\n' +
-    'Koi bhi sawaal ho, photos chahiye ya kuch aur — bas yahan message karo! 😊\n\n' +
+  if (data.preferred_call_time) d += '📞 *Callback time:* ' + data.preferred_call_time + '\n';
+  d += '\nHamare specialist *jald* aapko call karenge! 🙏\n\n' +
+    'Tab tak — koi bhi sawaal ho, kuch dekhna ho, ya aur details share karni ho — bas yahan message karo! Main yahan hoon 😊\n\n' +
     '📞 *+91 80357 35856*\n🌐 phoenixeventsandproduction.com\n📸 @phoenix_events_and_production';
 
   await sendWhatsApp(data.phone, d);
@@ -316,8 +319,8 @@ function extractFromTranscript(transcript) {
 }
 
 // ── ROUTES ──
-app.get('/', function(req, res) { res.json({ status: 'Phoenix Events Voice Agent VERSION 7', timestamp: new Date().toISOString() }); });
-app.get('/phoenix-bolna-agent', function(req, res) { res.json({ status: 'webhook active', version: 7 }); });
+app.get('/', function(req, res) { res.json({ status: 'Phoenix Events Voice Agent VERSION 8', timestamp: new Date().toISOString() }); });
+app.get('/phoenix-bolna-agent', function(req, res) { res.json({ status: 'webhook active', version: 8 }); });
 
 app.post('/phoenix-bolna-agent', async function(req, res) {
   console.log('\n=== BOLNA WEBHOOK ===');
@@ -423,6 +426,23 @@ app.post('/phoenix-bolna-agent', async function(req, res) {
       competitor_comparing: ext.competitor_comparing,
       duration_seconds: dur
     };
+    // Save transcript + summary to leads table so WA agent can read it
+    var callSummary = cleanVal(body.summary || body.call_summary || '');
+    var callTranscript = cleanVal(body.transcript || '');
+    if (!callSummary && final.event_type) {
+      // Build a basic summary if Bolna didn't provide one
+      callSummary = 'Voice call hua. Naam: ' + (final.name || 'unknown') + '. ';
+      if (final.event_type) callSummary += 'Event: ' + final.event_type + '. ';
+      if (final.guest_count) callSummary += 'Guests: ' + final.guest_count + '. ';
+      if (final.event_date) callSummary += 'Date: ' + final.event_date + '. ';
+      if (final.venue_name) callSummary += 'Venue: ' + final.venue_name + '. ';
+      if (final.package_type) callSummary += 'Package: ' + final.package_type + '. ';
+      if (final.services_needed) callSummary += 'Services: ' + final.services_needed + '. ';
+      if (final.preferred_call_time) callSummary += 'Preferred call time: ' + final.preferred_call_time + '. ';
+    }
+    final._callSummary = callSummary;
+    final._callTranscript = callTranscript;
+
     res.json({ status: 'received' });
     saveVoiceCall(final).catch(function(e) { console.error(e.message); });
     upsertLead(final).catch(function(e) { console.error(e.message); });
@@ -440,4 +460,4 @@ app.post('/phoenix-bolna-agent', async function(req, res) {
 });
 
 var PORT = process.env.PORT || 8080;
-app.listen(PORT, function() { console.log('Phoenix Events Voice Agent VERSION 7 running on port ' + PORT); });
+app.listen(PORT, function() { console.log('Phoenix Events Voice Agent VERSION 8 running on port ' + PORT); });

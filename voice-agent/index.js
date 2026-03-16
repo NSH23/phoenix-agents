@@ -42,11 +42,13 @@ function validDate(val) {
 }
 
 function parseDuration(body) {
-  var d = body.call_duration || body.duration || body.call_length ||
+  // Bolna sends duration as conversation_duration (confirmed from logs)
+  var d = body.conversation_duration || body.call_duration || body.duration ||
+    body.call_length || body.duration_seconds ||
     (body.metadata && body.metadata.call_duration) ||
     (body.metadata && body.metadata.duration) || 0;
-  var n = parseInt(d);
-  return isNaN(n) ? 0 : n;
+  var n = parseFloat(d);
+  return isNaN(n) ? 0 : Math.round(n);
 }
 
 function parseGuestCount(val) {
@@ -204,22 +206,27 @@ async function upsertLead(data) {
 
 async function sendWhatsApp(phone, message) {
   try {
-    if (!WA_TOKEN) { console.log('WA_TOKEN missing'); return; }
+    if (!WA_TOKEN) { console.error('WA_TOKEN missing — cannot send WA'); return; }
     var fp = phone.startsWith('+') ? phone : '+' + phone;
+    console.log('Sending WA to:', fp, '| Token starts:', WA_TOKEN.substring(0, 20) + '...');
     var chunks = message.length <= 4000 ? [message] : (function() {
       var arr = []; var t = message;
       while (t.length > 0) { var c = t.substring(0, 4000); arr.push(c.trim()); t = t.substring(c.length).trim(); }
       return arr;
     })();
     for (var i = 0; i < chunks.length; i++) {
-      await axios.post('https://graph.facebook.com/v18.0/' + WA_PHONE_ID + '/messages',
+      var waRes = await axios.post('https://graph.facebook.com/v18.0/' + WA_PHONE_ID + '/messages',
         { messaging_product: 'whatsapp', to: fp, type: 'text', text: { body: chunks[i] } },
         { headers: { Authorization: 'Bearer ' + WA_TOKEN, 'Content-Type': 'application/json' } }
       );
+      console.log('WA API response:', JSON.stringify(waRes.data).substring(0, 200));
       if (chunks.length > 1) await sleep(600);
     }
-    console.log('WA sent to', fp);
-  } catch (e) { console.error('sendWhatsApp:', JSON.stringify(e.response ? e.response.data : e.message)); }
+    console.log('WA sent OK to', fp);
+  } catch (e) {
+    console.error('sendWhatsApp FAILED:', JSON.stringify(e.response ? e.response.data : e.message));
+    console.error('Phone used:', phone, '| PhoneID:', WA_PHONE_ID);
+  }
 }
 
 async function sendWhatsAppImage(phone, imageUrl, caption) {
@@ -361,7 +368,7 @@ function extractFromTranscript(transcript) {
 }
 
 // ── ROUTES ──
-app.get('/', function(req, res) { res.json({ status: 'Phoenix Events Voice Agent VERSION 10', timestamp: new Date().toISOString() }); });
+app.get('/', function(req, res) { res.json({ status: 'Phoenix Events Voice Agent VERSION 11', timestamp: new Date().toISOString() }); });
 app.get('/phoenix-bolna-agent', function(req, res) { res.json({ status: 'webhook active', version: 8 }); });
 
 app.post('/phoenix-bolna-agent', async function(req, res) {
@@ -470,22 +477,38 @@ app.post('/phoenix-bolna-agent', async function(req, res) {
     var dur = parseDuration(body);
     console.log('COMPLETED:', p3, dur + 's');
     var ext = extractFromTranscript(body.transcript || '');
-    var ex = body.custom_extractions || body.extracted_data || body.extractions || {};
-    if (typeof ex === 'object') {
-      if (cleanVal(ex.customer_name)) ext.name = cleanVal(ex.customer_name);
-      if (cleanVal(ex.event_type)) ext.event_type = cleanVal(ex.event_type);
-      if (ex.venue_booked !== undefined) ext.venue_booked = ex.venue_booked;
-      if (cleanVal(ex.venue_name)) ext.venue_name = cleanVal(ex.venue_name);
-      if (ex.guest_count) ext.guest_count = cleanVal(String(ex.guest_count));
-      if (ex.event_date) ext.event_date = validDate(cleanVal(ex.event_date));
-      if (ex.package_type) ext.package_type = cleanVal(ex.package_type);
-      if (ex.services_needed) ext.services_needed = cleanVal(ex.services_needed);
-      if (ex.preferred_call_time) ext.preferred_call_time = cleanVal(ex.preferred_call_time);
-      if (ex.relationship_to_event) ext.relationship_to_event = cleanVal(ex.relationship_to_event);
-      if (ex.function_list) ext.function_list = cleanVal(ex.function_list);
-      if (ex.language_spoken) ext.language = cleanVal(ex.language_spoken);
-      if (ex.city_area) ext.city = cleanVal(ex.city_area);
-      if (ex.competitor_comparing) ext.competitor_comparing = ex.competitor_comparing;
+    // Bolna sends extractions in extracted_data or custom_extractions
+    var ex = body.extracted_data || body.custom_extractions || body.extractions || body.agent_extraction || {};
+    console.log('EXTRACTED DATA:', JSON.stringify(ex).substring(0, 300));
+    if (typeof ex === 'object' && ex !== null) {
+      // Support both field name variants Bolna might use
+      var n = cleanVal(ex.customer_name || ex.name || ex.caller_name || '');
+      if (n) ext.name = n;
+      var et = cleanVal(ex.event_type || ex.eventType || ex.occasion || '');
+      if (et) ext.event_type = et;
+      var vb = ex.venue_booked !== undefined ? ex.venue_booked : ex.venueBooked;
+      if (vb !== undefined) ext.venue_booked = vb;
+      var vn = cleanVal(ex.venue_name || ex.venueName || ex.venue || '');
+      if (vn) ext.venue_name = vn;
+      var gc = ex.guest_count || ex.guestCount || ex.guests;
+      if (gc) ext.guest_count = cleanVal(String(gc));
+      var ed = ex.event_date || ex.eventDate || ex.date;
+      if (ed) ext.event_date = validDate(cleanVal(ed));
+      var pt = cleanVal(ex.package_type || ex.packageType || ex.package || '');
+      if (pt) ext.package_type = pt;
+      var sn = cleanVal(ex.services_needed || ex.services || ex.servicesNeeded || '');
+      if (sn) ext.services_needed = sn;
+      var pct = cleanVal(ex.preferred_call_time || ex.callbackTime || ex.callback_time || '');
+      if (pct) ext.preferred_call_time = pct;
+      var rel = cleanVal(ex.relationship_to_event || ex.relationship || '');
+      if (rel) ext.relationship_to_event = rel;
+      var fl = cleanVal(ex.function_list || ex.functions || '');
+      if (fl) ext.function_list = fl;
+      var lang = cleanVal(ex.language_spoken || ex.language || '');
+      if (lang) ext.language = lang;
+      var ca = cleanVal(ex.city_area || ex.city || ex.area || '');
+      if (ca) ext.city = ca;
+      if (ex.competitor_comparing !== undefined) ext.competitor_comparing = ex.competitor_comparing;
     }
     var prev2 = await getLeadByPhone(p3);
     var final = {
@@ -540,4 +563,4 @@ app.post('/phoenix-bolna-agent', async function(req, res) {
 });
 
 var PORT = process.env.PORT || 8080;
-app.listen(PORT, function() { console.log('Phoenix Events Voice Agent VERSION 10 running on port ' + PORT); });
+app.listen(PORT, function() { console.log('Phoenix Events Voice Agent VERSION 11 running on port ' + PORT); });

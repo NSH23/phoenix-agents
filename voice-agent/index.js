@@ -94,13 +94,57 @@ async function getLeadByPhone(phone) {
 
 async function getMediaByKey(key) {
   try {
-    // text_content holds the image URL directly — no join needed
+    // text_content holds the media URL directly — no join needed
     var res = await supabase.get('/rest/v1/workflow_content?content_key=eq.' + key + '&is_active=eq.true&select=text_content');
     if (res.data && res.data[0] && res.data[0].text_content) return res.data[0].text_content;
     return null;
   } catch (e) { return null; }
 }
 
+// NEW: fetch all 4 images + 2 videos for a given event type
+async function getEventMedia(eventType) {
+  if (!eventType) return { images: [], videos: [] };
+  var slug = eventType.toLowerCase().replace(/\s+/g, '_');
+  var images = [];
+  var videos = [];
+
+  // image slots: event_{type}_image_1..4
+  for (var i = 1; i <= 4; i++) {
+    var img = await getMediaByKey('event_' + slug + '_image_' + i);
+    if (img) images.push(img);
+  }
+
+  // video slots: event_{type}_video_1..2
+  for (var j = 1; j <= 2; j++) {
+    var vid = await getMediaByKey('event_' + slug + '_video_' + j);
+    if (vid) videos.push(vid);
+  }
+
+  return { images: images, videos: videos };
+}
+
+// NEW: fetch all 4 images + 2 videos for a given venue index 1–7
+async function getVenueMediaByIndex(idx) {
+  if (!idx) return { images: [], videos: [] };
+  var images = [];
+  var videos = [];
+
+  // image slots: venue_{i}_image_1..4
+  for (var i = 1; i <= 4; i++) {
+    var img = await getMediaByKey('venue_' + idx + '_image_' + i);
+    if (img) images.push(img);
+  }
+
+  // video slots: venue_{i}_video_1..2
+  for (var j = 1; j <= 2; j++) {
+    var vid = await getMediaByKey('venue_' + idx + '_video_' + j);
+    if (vid) videos.push(vid);
+  }
+
+  return { images: images, videos: videos };
+}
+
+// (old single-image helper kept for safety, but no longer used)
 async function getEventImage(eventType) {
   if (!eventType) return null;
   var url = await getMediaByKey('event_' + eventType.toLowerCase().replace(/\s+/g, '_') + '_image');
@@ -239,6 +283,19 @@ async function sendWhatsAppImage(phone, imageUrl, caption) {
   } catch (e) { console.error('sendWhatsAppImage:', JSON.stringify(e.response ? e.response.data : e.message)); }
 }
 
+// NEW: send WhatsApp video
+async function sendWhatsAppVideo(phone, videoUrl, caption) {
+  try {
+    if (!WA_TOKEN || !videoUrl) return;
+    var fp = phone.startsWith('+') ? phone : '+' + phone;
+    await axios.post('https://graph.facebook.com/v18.0/' + WA_PHONE_ID + '/messages',
+      { messaging_product: 'whatsapp', to: fp, type: 'video', video: { link: videoUrl, caption: caption || '' } },
+      { headers: { Authorization: 'Bearer ' + WA_TOKEN, 'Content-Type': 'application/json' } }
+    );
+    console.log('WA video sent to', fp);
+  } catch (e) { console.error('sendWhatsAppVideo:', JSON.stringify(e.response ? e.response.data : e.message)); }
+}
+
 async function handleHandoffFlow(data) {
   console.log('Handoff WA flow for:', data.phone);
   var name = (data.name && data.name !== 'Guest' && data.name !== 'Unknown') ? data.name : '';
@@ -259,14 +316,28 @@ async function handleHandoffFlow(data) {
   await sendWhatsApp(data.phone, greeting);
   await sleep(1500);
 
-  // 2. Event portfolio image — always send if event type known
+  // 2. Event portfolio media — send all 4 images + 2 videos if available
   if (ev) {
-    var eImg = await getEventImage(ev);
-    if (eImg) {
-      await sendWhatsAppImage(data.phone, eImg, '🎊 Hamare ' + ev + ' events — aisa banate hain hum! ✨');
-      await sleep(1000);
+    var evMedia = await getEventMedia(ev);
+    if (evMedia.images.length || evMedia.videos.length) {
+      // Images
+      for (var ei = 0; ei < evMedia.images.length; ei++) {
+        var captionImg = ei === 0
+          ? '🎊 Hamare ' + ev + ' events — aisa banate hain hum! ✨'
+          : '';
+        await sendWhatsAppImage(data.phone, evMedia.images[ei], captionImg);
+        await sleep(800);
+      }
+      // Videos
+      for (var evv = 0; evv < evMedia.videos.length; evv++) {
+        var captionVid = evv === 0
+          ? '🎥 ' + ev + ' event ka short video preview'
+          : '';
+        await sendWhatsAppVideo(data.phone, evMedia.videos[evv], captionVid);
+        await sleep(1000);
+      }
     } else {
-      // No image uploaded yet — send text appreciation instead
+      // No media uploaded yet — send text appreciation instead
       await sendWhatsApp(data.phone,
         '🎊 *' + ev + ' events* mein hum kya karte hain:\n' +
         '✨ Custom theme decoration\n' +
@@ -282,14 +353,23 @@ async function handleHandoffFlow(data) {
 
   // 3. Venue section — logic based on whether venue is booked or not
   if (venueBooked && venue) {
-    // Already booked a venue — send their venue image + appreciation
+    // Already booked a venue — send their venue media (4 images + 2 videos) + appreciation
     var vi = getVenueIndex(venue);
     if (vi) {
-      var vImg = await getMediaByKey('venue_' + vi + '_image');
-      if (vImg) {
+      var vMedia = await getVenueMediaByIndex(vi);
+      for (var vii = 0; vii < vMedia.images.length; vii++) {
+        var vCaptionImg = vii === 0
+          ? '🏛️ ' + venue + ' — yahan hum kya kar sakte hain dekho! ✨'
+          : '';
+        await sendWhatsAppImage(data.phone, vMedia.images[vii], vCaptionImg);
         await sleep(800);
-        await sendWhatsAppImage(data.phone, vImg, '🏛️ ' + venue + ' — yahan hum kya kar sakte hain dekho! ✨');
-        await sleep(800);
+      }
+      for (var viv = 0; viv < vMedia.videos.length; viv++) {
+        var vCaptionVid = viv === 0
+          ? '🎥 ' + venue + ' setup ka short video preview'
+          : '';
+        await sendWhatsAppVideo(data.phone, vMedia.videos[viv], vCaptionVid);
+        await sleep(1000);
       }
     }
     await sendWhatsApp(data.phone,
@@ -319,11 +399,30 @@ async function handleHandoffFlow(data) {
     );
     await sleep(1200);
 
-    // Send images of first 2 venues as preview
-    var img1 = await getMediaByKey('venue_1_image');
-    if (img1) { await sendWhatsAppImage(data.phone, img1, '✨ Sky Blue Banquet Hall — Punawale/Ravet ⭐ 4.7'); await sleep(800); }
-    var img2 = await getMediaByKey('venue_3_image');
-    if (img2) { await sendWhatsAppImage(data.phone, img2, '✨ Blue Water Banquet Hall — Punawale ⭐ 5.0'); await sleep(800); }
+    // Send media for first 2 venues as preview (all available slots)
+    var v1Media = await getVenueMediaByIndex(1);
+    for (var i1 = 0; i1 < v1Media.images.length; i1++) {
+      var cap1 = i1 === 0 ? '✨ Sky Blue Banquet Hall — Punawale/Ravet ⭐ 4.7' : '';
+      await sendWhatsAppImage(data.phone, v1Media.images[i1], cap1);
+      await sleep(800);
+    }
+    for (var j1 = 0; j1 < v1Media.videos.length; j1++) {
+      var cap1v = j1 === 0 ? '🎥 Sky Blue Banquet Hall ka video preview' : '';
+      await sendWhatsAppVideo(data.phone, v1Media.videos[j1], cap1v);
+      await sleep(1000);
+    }
+
+    var v2Media = await getVenueMediaByIndex(2);
+    for (var i2 = 0; i2 < v2Media.images.length; i2++) {
+      var cap2 = i2 === 0 ? '✨ Blue Water Banquet Hall — Punawale ⭐ 5.0' : '';
+      await sendWhatsAppImage(data.phone, v2Media.images[i2], cap2);
+      await sleep(800);
+    }
+    for (var j2 = 0; j2 < v2Media.videos.length; j2++) {
+      var cap2v = j2 === 0 ? '🎥 Blue Water Banquet Hall ka video preview' : '';
+      await sendWhatsAppVideo(data.phone, v2Media.videos[j2], cap2v);
+      await sleep(1000);
+    }
   }
 
   // 4. Details summary + specialist CTA + vaada

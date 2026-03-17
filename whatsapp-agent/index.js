@@ -177,10 +177,11 @@ async function getMediaImage(key) {
     // Check alias map first
     var resolvedKey = VENUE_KEY_MAP[normalizedKey] || normalizedKey;
     console.log('Image lookup: ' + key + ' → ' + resolvedKey);
-    var res = await supabase.get('/rest/v1/workflow_content?content_key=eq.' + resolvedKey + '&is_active=eq.true&select=text_content,media_assets(public_url)');
-    if (res.data && res.data[0]) {
-      if (res.data[0].media_assets && res.data[0].media_assets.public_url) return res.data[0].media_assets.public_url;
-      if (res.data[0].text_content) return res.data[0].text_content;
+    // text_content holds the image URL directly — no join needed
+    var res = await supabase.get('/rest/v1/workflow_content?content_key=eq.' + resolvedKey + '&is_active=eq.true&select=text_content');
+    if (res.data && res.data[0] && res.data[0].text_content) {
+      console.log('Image URL found:', res.data[0].text_content.substring(0, 80));
+      return res.data[0].text_content;
     }
     return null;
   } catch (e) { console.error('getMediaImage error:', e.message); return null; }

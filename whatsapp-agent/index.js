@@ -139,12 +139,51 @@ async function getKnowledgeBase() {
   } catch (e) { return []; }
 }
 
+// Map any venue name variation Groq might invent → correct content_key
+var VENUE_KEY_MAP = {
+  'sky_blue_banquet_hall_image': 'venue_1_image',
+  'sky_blue_image': 'venue_1_image',
+  'skyblue_image': 'venue_1_image',
+  'blue_water_banquet_hall_image': 'venue_2_image',
+  'blue_water_image': 'venue_2_image',
+  'bluewater_image': 'venue_2_image',
+  'thopate_banquets_image': 'venue_3_image',
+  'thopate_image': 'venue_3_image',
+  'ramkrishna_veg_banquet_image': 'venue_4_image',
+  'ramkrishna_image': 'venue_4_image',
+  'shree_krishna_palace_image': 'venue_5_image',
+  'shree_krishna_image': 'venue_5_image',
+  'raghunandan_ac_banquet_image': 'venue_6_image',
+  'raghunandan_image': 'venue_6_image',
+  'rangoli_banquet_hall_image': 'venue_7_image',
+  'rangoli_image': 'venue_7_image',
+  // event aliases
+  'shaadi_image': 'event_wedding_image',
+  'wedding_image': 'event_wedding_image',
+  'birthday_image': 'event_birthday_image',
+  'bday_image': 'event_birthday_image',
+  'engagement_image': 'event_engagement_image',
+  'sangeet_image': 'event_sangeet_image',
+  'haldi_image': 'event_haldi_image',
+  'mehendi_image': 'event_mehendi_image',
+  'anniversary_image': 'event_anniversary_image',
+  'corporate_image': 'event_corporate_image',
+};
+
 async function getMediaImage(key) {
   try {
-    var res = await supabase.get('/rest/v1/workflow_content?content_key=eq.' + key + '&is_active=eq.true&select=media_assets(public_url)');
-    if (res.data && res.data[0] && res.data[0].media_assets) return res.data[0].media_assets.public_url;
+    // Normalize key — lowercase, replace spaces/hyphens with underscores
+    var normalizedKey = key.toLowerCase().replace(/[\s-]+/g, '_');
+    // Check alias map first
+    var resolvedKey = VENUE_KEY_MAP[normalizedKey] || normalizedKey;
+    console.log('Image lookup: ' + key + ' → ' + resolvedKey);
+    var res = await supabase.get('/rest/v1/workflow_content?content_key=eq.' + resolvedKey + '&is_active=eq.true&select=text_content,media_assets(public_url)');
+    if (res.data && res.data[0]) {
+      if (res.data[0].media_assets && res.data[0].media_assets.public_url) return res.data[0].media_assets.public_url;
+      if (res.data[0].text_content) return res.data[0].text_content;
+    }
     return null;
-  } catch (e) { return null; }
+  } catch (e) { console.error('getMediaImage error:', e.message); return null; }
 }
 
 function buildKnowledgeContext(kb) {
@@ -301,10 +340,26 @@ async function callGroq(phone, userMessage, lead, history, knowledgeBase) {
     '8. Preferred callback time → specialist ke liye\n' +
     '9. Summary + specialist CTA\n\n' +
 
-    'IMAGES — ZAROOR BHEJO:\n' +
-    '- [SEND:image=event_wedding_image], [SEND:image=event_birthday_image], etc.\n' +
-    '- [SEND:image=venue_1_image] through [SEND:image=venue_7_image]\n' +
-    '- Jab bhi event ya venue discuss ho → relevant image bhejo\n\n' +
+    'IMAGES — ZAROOR BHEJO (exact keys use karo):\n' +
+    'EVENT IMAGES — exact key:\n' +
+    '[SEND:image=event_wedding_image] — shaadi/wedding\n' +
+    '[SEND:image=event_birthday_image] — birthday\n' +
+    '[SEND:image=event_engagement_image] — engagement\n' +
+    '[SEND:image=event_sangeet_image] — sangeet\n' +
+    '[SEND:image=event_haldi_image] — haldi\n' +
+    '[SEND:image=event_mehendi_image] — mehendi\n' +
+    '[SEND:image=event_anniversary_image] — anniversary\n' +
+    '[SEND:image=event_corporate_image] — corporate\n' +
+    'VENUE IMAGES — exact key:\n' +
+    '[SEND:image=venue_1_image] — Sky Blue Banquet Hall\n' +
+    '[SEND:image=venue_2_image] — Blue Water Banquet Hall\n' +
+    '[SEND:image=venue_3_image] — Thopate Banquets\n' +
+    '[SEND:image=venue_4_image] — RamKrishna Veg Banquet\n' +
+    '[SEND:image=venue_5_image] — Shree Krishna Palace\n' +
+    '[SEND:image=venue_6_image] — Raghunandan AC Banquet\n' +
+    '[SEND:image=venue_7_image] — Rangoli Banquet Hall\n' +
+    'KABHI BHI apni taraf se key mat banao — sirf yahi exact keys use karo\n' +
+    'Jab bhi event ya venue discuss ho → relevant image bhejo\n\n' +
 
     'STRICT RULES:\n' +
     '- Sirf Phoenix Events related topics pe baat karo\n' +
@@ -386,7 +441,21 @@ async function handleMessage(phone, userMessage, name, msgId) {
   }
 
   if (Object.keys(extracted).length > 0) {
-    await upsertLead(phone, extracted.name || name, extracted);
+    // Remove fields that don't exist in leads table schema
+    var safeExtracted = Object.assign({}, extracted);
+    delete safeExtracted.venue_name; // handled separately above
+    // Only keep known valid fields
+    var validFields = ['name','event_type','event_date','guest_count','venue','status',
+      'package_type','services_needed','theme','indoor_outdoor','email','city',
+      'source','function_list','relationship_to_event','preferred_call_time',
+      'instagram_id','urgency_level','callback_date','callback_time','associate_name'];
+    var filteredExtracted = {};
+    Object.keys(safeExtracted).forEach(function(k) {
+      if (validFields.indexOf(k) !== -1) filteredExtracted[k] = safeExtracted[k];
+    });
+    if (Object.keys(filteredExtracted).length > 0) {
+      await upsertLead(phone, filteredExtracted.name || name, filteredExtracted);
+    }
   }
   if (scoreIncrement) await incrementLeadScore(phone, scoreIncrement);
 }
@@ -429,8 +498,8 @@ app.post('/whatsapp', async function(req, res) {
 });
 
 app.get('/', function(req, res) {
-  res.json({ status: 'Phoenix WhatsApp AI Agent VERSION 4', timestamp: new Date().toISOString() });
+  res.json({ status: 'Phoenix WhatsApp AI Agent VERSION 5', timestamp: new Date().toISOString() });
 });
 
 var PORT = process.env.PORT || 3000;
-app.listen(PORT, function() { console.log('Phoenix WhatsApp AI Agent VERSION 4 running on port ' + PORT); });
+app.listen(PORT, function() { console.log('Phoenix WhatsApp AI Agent VERSION 5 running on port ' + PORT); });

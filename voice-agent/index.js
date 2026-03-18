@@ -450,8 +450,8 @@ function extractFromTranscript(transcript) {
 }
 
 // ── ROUTES ──
-app.get('/', function(req, res) { res.json({ status: 'Phoenix Events Voice Agent VERSION 14', timestamp: new Date().toISOString() }); });
-app.get('/phoenix-bolna-agent', function(req, res) { res.json({ status: 'webhook active', version: 14 }); });
+app.get('/', function(req, res) { res.json({ status: 'Phoenix Events Voice Agent VERSION 15', timestamp: new Date().toISOString() }); });
+app.get('/phoenix-bolna-agent', function(req, res) { res.json({ status: 'webhook active', version: 15 }); });
 
 app.post('/phoenix-bolna-agent', async function(req, res) {
   console.log('\n=== BOLNA WEBHOOK ===');
@@ -496,19 +496,31 @@ app.post('/phoenix-bolna-agent', async function(req, res) {
   // ── get_lead_data ──
   if (toolName === 'get_lead_data') {
     var phone = cleanPhone(userNumber || (body && body.user_number));
-    if (!phone) return res.json({ result: 'new_caller', is_returning: false });
+    if (!phone) return res.json({ result: 'Naya caller hai. Koi data nahi mila. Step 1 se shuru karo.' });
     var lead = await getLeadByPhone(phone);
     if (lead && lead.name && lead.name !== 'Guest') {
-      return res.json({
-        result: 'returning_caller', is_returning: true,
-        name: lead.name || '', event_type: lead.event_type || '',
-        venue: lead.venue || '', guest_count: lead.guest_count ? String(lead.guest_count) : '',
-        event_date: lead.event_date || '', call_count: lead.call_count || 0,
-        package_type: lead.package_type || '', services_needed: lead.services_needed || '',
-        preferred_call_time: lead.preferred_call_time || '', last_channel: lead.last_channel || 'voice'
-      });
+      // Build natural language summary so Bolna LLM can actually USE this data in conversation
+      var summary = 'RETURNING CALLER — Yeh pehle bhi call kar chuke hain. Inke baare mein jo pata hai:\n';
+      summary += 'Naam: ' + lead.name + '\n';
+      if (lead.event_type) summary += 'Event type: ' + lead.event_type + '\n';
+      if (lead.event_date) summary += 'Event date: ' + lead.event_date + '\n';
+      if (lead.guest_count) summary += 'Guest count: ' + lead.guest_count + '\n';
+      if (lead.venue) summary += 'Venue: ' + lead.venue + '\n';
+      if (lead.package_type) summary += 'Package: ' + lead.package_type + '\n';
+      if (lead.services_needed) summary += 'Services: ' + lead.services_needed + '\n';
+      if (lead.preferred_call_time) summary += 'Preferred callback time: ' + lead.preferred_call_time + '\n';
+      if (lead.relationship_to_event) summary += 'Relationship to event: ' + lead.relationship_to_event + '\n';
+      if (lead.function_list) summary += 'Functions: ' + lead.function_list + '\n';
+      if (lead.indoor_outdoor) summary += 'Indoor/Outdoor: ' + lead.indoor_outdoor + '\n';
+      if (lead.theme) summary += 'Theme: ' + lead.theme + '\n';
+      if (lead.city) summary += 'City/Area: ' + lead.city + '\n';
+      summary += 'Total calls so far: ' + (lead.call_count || 1) + '\n';
+      summary += '\nINSTRUCTION: Jo data upar diya hai woh dobara mat poocho. Sirf jo MISSING hai woh collect karo. ';
+      summary += 'Warmly greet them by name and ask if same event ke baare mein baat karni hai ya koi naya plan hai.';
+      console.log('Returning caller data sent to Bolna:', lead.name, '| Event:', lead.event_type);
+      return res.json({ result: summary });
     }
-    return res.json({ result: 'new_caller', is_returning: false });
+    return res.json({ result: 'Naya caller hai. Koi pehle ka data nahi mila. Step 1 se shuru karo — naam poocho.' });
   }
 
   // ── get_venue_list ──
@@ -645,4 +657,4 @@ app.post('/phoenix-bolna-agent', async function(req, res) {
 });
 
 var PORT = process.env.PORT || 8080;
-app.listen(PORT, function() { console.log('Phoenix Events Voice Agent VERSION 14 running on port ' + PORT); });
+app.listen(PORT, function() { console.log('Phoenix Events Voice Agent VERSION 15 running on port ' + PORT); });

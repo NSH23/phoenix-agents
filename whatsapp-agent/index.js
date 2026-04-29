@@ -3,10 +3,11 @@ const axios = require('axios');
 const app = express();
 app.use(express.json());
 
-const SUPABASE_URL = 'https://qjxqebtxhfwaufmccewj.supabase.co';
+// ── CONFIG ──
+const SUPABASE_URL = 'https://sainjerowmjetpmtezwg.supabase.co';
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const WA_TOKEN = process.env.WA_TOKEN;
-const WA_PHONE_ID = process.env.WA_PHONE_ID || '1023140200877702';
+const WA_PHONE_ID = process.env.WA_PHONE_ID;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'phoenix_verify_2024';
 const GROQ_KEY = process.env.GROQ_API_KEY;
 
@@ -20,6 +21,7 @@ const supabase = axios.create({
   }
 });
 
+// ── DEDUPLICATION ──
 var processedMessages = new Set();
 function isDuplicate(msgId) {
   if (!msgId) return false;
@@ -38,6 +40,7 @@ function splitMessage(text) {
   return chunks;
 }
 
+// ── WA SEND ──
 async function sendText(phone, message) {
   try {
     var fp = phone.startsWith('+') ? phone : '+' + phone;
@@ -64,45 +67,73 @@ async function sendImage(phone, imageUrl, caption) {
   } catch (e) { console.error('sendImage FAILED:', JSON.stringify(e.response ? e.response.data : e.message)); }
 }
 
-async function sendVideo(phone, videoUrl, caption) {
+// Videos sent as text link (YouTube) since WA video requires direct MP4 URL
+async function sendVideoAsLink(phone, youtubeId, caption) {
   try {
-    if (!videoUrl) return;
-    var fp = phone.startsWith('+') ? phone : '+' + phone;
-    await axios.post('https://graph.facebook.com/v18.0/' + WA_PHONE_ID + '/messages',
-      { messaging_product: 'whatsapp', to: fp, type: 'video', video: { link: videoUrl, caption: caption || '' } },
-      { headers: { Authorization: 'Bearer ' + WA_TOKEN, 'Content-Type': 'application/json' } }
-    );
-  } catch (e) { console.error('sendVideo FAILED:', JSON.stringify(e.response ? e.response.data : e.message)); }
+    if (!youtubeId) return;
+    var msg = (caption ? caption + '\n' : '') + '🎥 https://www.youtube.com/watch?v=' + youtubeId;
+    await sendText(phone, msg);
+  } catch (e) { console.error('sendVideoAsLink FAILED:', e.message); }
 }
+
+// ── SUPABASE — NEW SCHEMA (wp_leads, wp_conversations) ──
 
 async function getLead(phone) {
   try {
-    var res = await supabase.get('/rest/v1/leads?phone=eq.' + phone + '&select=*');
+    var res = await supabase.get('/rest/v1/wp_leads?phone=eq.' + encodeURIComponent(phone) + '&select=*');
     return res.data && res.data[0] ? res.data[0] : null;
-  } catch (e) { return null; }
+  } catch (e) { console.error('getLead:', e.message); return null; }
 }
 
 async function upsertLead(phone, name, fields) {
   try {
     var existing = await getLead(phone);
     var now = new Date().toISOString();
+
+    // Extract known top-level fields, rest go into metadata
+    var topLevel = ['name','phone','email','status','event_type','package_type','urgency_level','lead_score','source_channel','last_message','tags'];
+    var topFields = {};
+    var metaFields = {};
+
+    Object.keys(fields || {}).forEach(function(k) {
+      if (topLevel.indexOf(k) !== -1) topFields[k] = fields[k];
+      else metaFields[k] = fields[k];
+    });
+
     if (!existing) {
+      // New lead
       var payload = Object.assign({
-        phone: phone, name: name || 'Friend', status: 'new', step: 'ai_chat',
-        source: fields && fields.source ? fields.source : 'whatsapp',
-        first_channel: 'whatsapp', last_channel: 'whatsapp',
-        whatsapp_count: 1, call_count: 0, lead_score: 0,
-        last_interaction: now, created_at: now
-      }, fields || {});
-      await supabase.post('/rest/v1/leads', payload);
+        phone: phone,
+        name: name || 'Friend',
+        status: 'new',
+        source_channel: 'whatsapp',
+        lead_score: 0,
+        created_at: now,
+        updated_at: now
+      }, topFields);
+
+      // Merge extra fields into metadata
+      if (Object.keys(metaFields).length > 0) {
+        payload.metadata = metaFields;
+      }
+
+      await supabase.post('/rest/v1/wp_leads', payload);
+      console.log('New wp_lead created:', phone);
     } else {
-      var update = Object.assign({
-        last_interaction: now, last_channel: 'whatsapp',
-        whatsapp_count: (existing.whatsapp_count || 0) + 1, updated_at: now
-      }, fields || {});
+      // Update existing lead
+      var update = Object.assign({ updated_at: now }, topFields);
+
+      // Merge new metaFields into existing metadata
+      if (Object.keys(metaFields).length > 0) {
+        var existingMeta = existing.metadata || {};
+        update.metadata = Object.assign({}, existingMeta, metaFields);
+      }
+
       if (name && name !== 'Friend' && name !== 'Unknown' && !existing.name) update.name = name;
-      if (existing.status === 'qualified' || existing.status === 'converted') delete update.status;
-      await supabase.patch('/rest/v1/leads?phone=eq.' + phone, update);
+      if (existing.status === 'converted') delete update.status;
+
+      await supabase.patch('/rest/v1/wp_leads?phone=eq.' + encodeURIComponent(phone), update);
+      console.log('wp_lead updated:', phone);
     }
   } catch (e) { console.error('upsertLead:', e.message); }
 }
@@ -110,13 +141,17 @@ async function upsertLead(phone, name, fields) {
 async function incrementLeadScore(phone, amount) {
   try {
     var lead = await getLead(phone);
-    if (lead) await supabase.patch('/rest/v1/leads?phone=eq.' + phone, { lead_score: (lead.lead_score || 0) + amount });
+    if (lead) {
+      await supabase.patch('/rest/v1/wp_leads?phone=eq.' + encodeURIComponent(phone),
+        { lead_score: (lead.lead_score || 0) + amount, updated_at: new Date().toISOString() }
+      );
+    }
   } catch (e) {}
 }
 
 async function getConversationHistory(phone) {
   try {
-    var res = await supabase.get('/rest/v1/conversations?lead_phone=eq.' + phone + '&channel=eq.whatsapp&order=created_at.desc&limit=20&select=direction,content,created_at');
+    var res = await supabase.get('/rest/v1/wp_conversations?lead_phone=eq.' + encodeURIComponent(phone) + '&order=created_at.desc&limit=20&select=direction,message,created_at');
     if (!res.data || res.data.length === 0) return [];
     return res.data.reverse();
   } catch (e) { return []; }
@@ -124,109 +159,126 @@ async function getConversationHistory(phone) {
 
 async function logInbound(phone, message, msgId) {
   try {
-    await supabase.post('/rest/v1/conversations', {
-      lead_phone: phone, direction: 'inbound', message_type: 'text',
-      content: message, whatsapp_message_id: msgId || '', status: 'received', channel: 'whatsapp'
-    }, { headers: { Prefer: 'resolution=ignore-duplicates' } });
+    // First get or create the lead to get its ID
+    var lead = await getLead(phone);
+    await supabase.post('/rest/v1/wp_conversations', {
+      lead_id: lead ? lead.id : null,
+      lead_phone: phone,
+      direction: 'inbound',
+      message: message,
+      message_type: 'text',
+      metadata: msgId ? { whatsapp_message_id: msgId } : {}
+    });
   } catch (e) {}
 }
 
 async function logOutbound(phone, message) {
   try {
-    await supabase.post('/rest/v1/conversations', {
-      lead_phone: phone, direction: 'outbound', message_type: 'text',
-      content: message, status: 'sent', channel: 'whatsapp'
+    var lead = await getLead(phone);
+    await supabase.post('/rest/v1/wp_conversations', {
+      lead_id: lead ? lead.id : null,
+      lead_phone: phone,
+      direction: 'outbound',
+      message: message,
+      message_type: 'text'
     });
   } catch (e) {}
 }
 
+// ── MEDIA — NEW SCHEMA (wp_media_assets: cloudinary_url for images, youtube_id for videos) ──
+
+// Get images for an event type or venue
+// category examples: 'wedding', 'birthday', 'venue_sky_blue' etc.
+// We fetch from wp_media_assets — admin uploads tagged by title/description
+async function getMediaByCategory(category) {
+  try {
+    // Search by title or description containing the category keyword
+    var res = await supabase.get(
+      '/rest/v1/wp_media_assets?is_active=eq.true&select=media_type,cloudinary_url,youtube_id,title' +
+      '&or=(title.ilike.*' + encodeURIComponent(category) + '*,description.ilike.*' + encodeURIComponent(category) + '*)' +
+      '&order=created_at.asc&limit=6'
+    );
+    if (!res.data || res.data.length === 0) return { images: [], videos: [] };
+    var images = [];
+    var videos = [];
+    res.data.forEach(function(asset) {
+      if (asset.media_type === 'image' && asset.cloudinary_url) images.push(asset.cloudinary_url);
+      if (asset.media_type === 'video' && asset.youtube_id) videos.push(asset.youtube_id);
+    });
+    return { images: images.slice(0, 4), videos: videos.slice(0, 2) };
+  } catch (e) { console.error('getMediaByCategory error:', e.message); return { images: [], videos: [] }; }
+}
+
+// Map event type → search keyword
+function getEventKeyword(eventType) {
+  if (!eventType) return '';
+  var t = eventType.toLowerCase();
+  if (t.includes('wedding') || t.includes('shaadi')) return 'wedding';
+  if (t.includes('birthday')) return 'birthday';
+  if (t.includes('engagement')) return 'engagement';
+  if (t.includes('sangeet')) return 'sangeet';
+  if (t.includes('haldi')) return 'haldi';
+  if (t.includes('mehendi')) return 'mehendi';
+  if (t.includes('anniversary')) return 'anniversary';
+  if (t.includes('corporate')) return 'corporate';
+  if (t.includes('reception')) return 'reception';
+  return t;
+}
+
+// Map venue name → search keyword
+function getVenueKeyword(venueName) {
+  if (!venueName) return '';
+  var v = venueName.toLowerCase();
+  if (v.includes('sky blue')) return 'sky blue';
+  if (v.includes('blue water')) return 'blue water';
+  if (v.includes('thopate')) return 'thopate';
+  if (v.includes('ramkrishna') || v.includes('ram krishna')) return 'ramkrishna';
+  if (v.includes('shree krishna')) return 'shree krishna';
+  if (v.includes('raghunandan')) return 'raghunandan';
+  if (v.includes('rangoli')) return 'rangoli';
+  return venueName.split(' ')[0].toLowerCase();
+}
+
+// Send event portfolio (images + video links)
+async function sendEventPortfolio(phone, eventType) {
+  var keyword = getEventKeyword(eventType);
+  if (!keyword) return;
+  var media = await getMediaByCategory(keyword);
+  for (var i = 0; i < media.images.length; i++) {
+    await sleep(600);
+    var cap = i === 0 ? ('📸 Hamare *' + eventType + '* events — aisa banate hain hum! ✨') : '';
+    await sendImage(phone, media.images[i], cap);
+  }
+  for (var j = 0; j < media.videos.length; j++) {
+    await sleep(800);
+    var vcap = j === 0 ? ('🎥 ' + eventType + ' event highlights') : '';
+    await sendVideoAsLink(phone, media.videos[j], vcap);
+  }
+}
+
+// Send venue portfolio
+async function sendVenuePortfolio(phone, venueName) {
+  var keyword = getVenueKeyword(venueName);
+  if (!keyword) return;
+  var media = await getMediaByCategory(keyword);
+  for (var i = 0; i < media.images.length; i++) {
+    await sleep(600);
+    var cap = i === 0 ? ('🏛️ *' + venueName + '* — hamare kaam ki jhalak ✨') : '';
+    await sendImage(phone, media.images[i], cap);
+  }
+  for (var j = 0; j < media.videos.length; j++) {
+    await sleep(800);
+    await sendVideoAsLink(phone, media.videos[j], '🎥 ' + venueName + ' highlights');
+  }
+}
+
+// ── KNOWLEDGE BASE ──
 async function getKnowledgeBase() {
   try {
+    // knowledge_base table may or may not exist in new schema — graceful fallback
     var res = await supabase.get('/rest/v1/knowledge_base?is_active=eq.true&select=category,title,content&order=category.asc');
     return res.data || [];
   } catch (e) { return []; }
-}
-
-var VENUE_KEY_MAP = {
-  'sky_blue_banquet_hall_image': 'venue_1', 'sky_blue_image': 'venue_1', 'skyblue_image': 'venue_1', 'venue_1_image': 'venue_1',
-  'blue_water_banquet_hall_image': 'venue_2', 'blue_water_image': 'venue_2', 'bluewater_image': 'venue_2', 'venue_2_image': 'venue_2',
-  'thopate_banquets_image': 'venue_3', 'thopate_image': 'venue_3', 'venue_3_image': 'venue_3',
-  'ramkrishna_veg_banquet_image': 'venue_4', 'ramkrishna_image': 'venue_4', 'venue_4_image': 'venue_4',
-  'shree_krishna_palace_image': 'venue_5', 'shree_krishna_image': 'venue_5', 'venue_5_image': 'venue_5',
-  'raghunandan_ac_banquet_image': 'venue_6', 'raghunandan_image': 'venue_6', 'venue_6_image': 'venue_6',
-  'rangoli_banquet_hall_image': 'venue_7', 'rangoli_image': 'venue_7', 'venue_7_image': 'venue_7',
-  'shaadi_image': 'event_wedding', 'wedding_image': 'event_wedding', 'event_wedding_image': 'event_wedding',
-  'birthday_image': 'event_birthday', 'bday_image': 'event_birthday', 'event_birthday_image': 'event_birthday',
-  'engagement_image': 'event_engagement', 'event_engagement_image': 'event_engagement',
-  'sangeet_image': 'event_sangeet', 'event_sangeet_image': 'event_sangeet',
-  'haldi_image': 'event_haldi', 'event_haldi_image': 'event_haldi',
-  'mehendi_image': 'event_mehendi', 'event_mehendi_image': 'event_mehendi',
-  'anniversary_image': 'event_anniversary', 'event_anniversary_image': 'event_anniversary',
-  'corporate_image': 'event_corporate', 'event_corporate_image': 'event_corporate'
-};
-
-async function getWorkflowUrl(contentKey) {
-  try {
-    var res = await supabase.get('/rest/v1/workflow_content?content_key=eq.' + encodeURIComponent(contentKey) + '&is_active=eq.true&select=text_content');
-    if (res.data && res.data[0] && res.data[0].text_content) return res.data[0].text_content;
-    return null;
-  } catch (e) { console.error('getWorkflowUrl error:', e.message); return null; }
-}
-
-async function getMediaBundle(key) {
-  try {
-    var normalizedKey = key.toLowerCase().replace(/[\s-]+/g, '_');
-    var canonical = VENUE_KEY_MAP[normalizedKey] || normalizedKey;
-    console.log('Media lookup:', key, '→', canonical);
-    var images = [];
-    var videos = [];
-    var mEvent = canonical.match(/^event_([a-z0-9_]+)$/);
-    var mVenue = canonical.match(/^venue_(\d+)$/);
-    if (mEvent) {
-      var slug = mEvent[1];
-      var ip = []; for (var i = 1; i <= 4; i++) ip.push(getWorkflowUrl('event_' + slug + '_image_' + i));
-      var vp = []; for (var j = 1; j <= 2; j++) vp.push(getWorkflowUrl('event_' + slug + '_video_' + j));
-      (await Promise.all(ip)).forEach(function(u) { if (u) images.push(u); });
-      (await Promise.all(vp)).forEach(function(u) { if (u) videos.push(u); });
-      return { images: images, videos: videos };
-    }
-    if (mVenue) {
-      var idx = parseInt(mVenue[1], 10);
-      if (!isNaN(idx)) {
-        var vip = []; for (var ii = 1; ii <= 4; ii++) vip.push(getWorkflowUrl('venue_' + idx + '_image_' + ii));
-        var vvp = []; for (var jj = 1; jj <= 2; jj++) vvp.push(getWorkflowUrl('venue_' + idx + '_video_' + jj));
-        (await Promise.all(vip)).forEach(function(u) { if (u) images.push(u); });
-        (await Promise.all(vvp)).forEach(function(u) { if (u) videos.push(u); });
-        return { images: images, videos: videos };
-      }
-    }
-    var single = await getWorkflowUrl(canonical);
-    if (single) images.push(single);
-    return { images: images, videos: videos };
-  } catch (e) { console.error('getMediaBundle error:', e.message); return { images: [], videos: [] }; }
-}
-
-// Contextual captions based on key name
-function getMediaCaption(key, index, isVideo) {
-  var k = (key || '').toLowerCase();
-  var pre = isVideo ? '🎥' : '📸';
-  if (index > 0) return ''; // only first item gets caption
-  if (k.includes('wedding') || k.includes('shaadi')) return pre + ' Hamare Wedding events — aisa banate hain hum! ✨';
-  if (k.includes('birthday') || k.includes('bday')) return pre + ' Birthday party — itna sundar karte hain hum! 🎂';
-  if (k.includes('engagement')) return pre + ' Engagement decoration — ekdum filmy feel! 💍';
-  if (k.includes('sangeet')) return pre + ' Sangeet night — full entertainment! 🎵';
-  if (k.includes('haldi')) return pre + ' Haldi decoration — rang-birangi aur traditional! 🌸';
-  if (k.includes('mehendi')) return pre + ' Mehendi setup — bohot khoobsurat! 🎨';
-  if (k.includes('anniversary')) return pre + ' Anniversary decoration — romantic aur special! 💝';
-  if (k.includes('corporate')) return pre + ' Corporate event — professional aur impactful! 🏢';
-  if (k.includes('venue_1') || k.includes('sky_blue')) return pre + ' Sky Blue Banquet Hall — hamare kaam ki jhalak ✨';
-  if (k.includes('venue_2') || k.includes('blue_water')) return pre + ' Blue Water Banquet Hall — hamare kaam ki jhalak ✨';
-  if (k.includes('venue_3') || k.includes('thopate')) return pre + ' Thopate Banquets — hamare kaam ki jhalak ✨';
-  if (k.includes('venue_4') || k.includes('ramkrishna')) return pre + ' RamKrishna Veg Banquet — hamare kaam ki jhalak ✨';
-  if (k.includes('venue_5') || k.includes('shree_krishna')) return pre + ' Shree Krishna Palace — hamare kaam ki jhalak ✨';
-  if (k.includes('venue_6') || k.includes('raghunandan')) return pre + ' Raghunandan AC Banquet — hamare kaam ki jhalak ✨';
-  if (k.includes('venue_7') || k.includes('rangoli')) return pre + ' Rangoli Banquet Hall — hamare kaam ki jhalak ✨';
-  return pre + ' Phoenix Events — hamare kaam ki jhalak ✨';
 }
 
 function buildKnowledgeContext(kb) {
@@ -241,6 +293,7 @@ function buildKnowledgeContext(kb) {
   }).join('\n\n');
 }
 
+// ── EXTRACT LEAD DATA FROM AI RESPONSE ──
 function extractLeadData(aiText) {
   var updates = {};
   var patterns = {
@@ -256,7 +309,6 @@ function extractLeadData(aiText) {
     indoor_outdoor: /\[LEAD:indoor_outdoor=([^\]]+)\]/,
     email: /\[LEAD:email=([^\]]+)\]/,
     city: /\[LEAD:city=([^\]]+)\]/,
-    source: /\[LEAD:source=([^\]]+)\]/,
     function_list: /\[LEAD:functions=([^\]]+)\]/,
     relationship_to_event: /\[LEAD:relationship=([^\]]+)\]/,
     preferred_call_time: /\[LEAD:call_time=([^\]]+)\]/,
@@ -287,48 +339,44 @@ function isOurVenue(venueName) {
   return OUR_VENUE_KEYWORDS.some(function(k) { return lower.indexOf(k) !== -1; });
 }
 
+// ── GROQ AI ──
 async function callGroq(phone, userMessage, lead, history, knowledgeBase) {
   var kb = buildKnowledgeContext(knowledgeBase);
   var alreadyKnow = [];
   var missing = [];
   var venueIsOurs = false;
 
+  // Read from both top-level fields and metadata
+  var meta = (lead && lead.metadata) || {};
+
   if (lead) {
     var hasName = lead.name && lead.name !== 'Friend' && lead.name !== 'Guest' && lead.name !== 'Unknown';
     if (hasName) alreadyKnow.push('Naam: ' + lead.name); else missing.push('naam');
     if (lead.event_type) alreadyKnow.push('Event type: ' + lead.event_type); else missing.push('event type');
-    if (lead.event_date) alreadyKnow.push('Event date: ' + lead.event_date); else missing.push('event date');
-    if (lead.guest_count) alreadyKnow.push('Guests: ' + lead.guest_count); else missing.push('guest count');
-    if (lead.venue) { alreadyKnow.push('Venue: ' + lead.venue); venueIsOurs = isOurVenue(lead.venue); } else missing.push('venue');
+    if (meta.event_date) alreadyKnow.push('Event date: ' + meta.event_date); else missing.push('event date');
+    if (meta.guest_count) alreadyKnow.push('Guests: ' + meta.guest_count); else missing.push('guest count');
+    if (meta.venue) { alreadyKnow.push('Venue: ' + meta.venue); venueIsOurs = isOurVenue(meta.venue); } else missing.push('venue');
 
-    // Priority order: function_list → services_needed → indoor_outdoor → theme → city_area (only if not our venue) → package_type
-    if (lead.function_list) alreadyKnow.push('Associated functions: ' + lead.function_list); else missing.push('function_list — "Wedding ke saath aur kya hoga? Mehendi, haldi, sangeet, reception?"');
-    if (lead.services_needed) alreadyKnow.push('Services needed: ' + lead.services_needed); else missing.push('services_needed — "Kaun si services chahiye? Decoration, photography, videography, DJ, lighting, mandap?"');
-    if (lead.indoor_outdoor) alreadyKnow.push('Indoor/Outdoor: ' + lead.indoor_outdoor); else missing.push('indoor_outdoor — "Event indoor hoga ya outdoor?"');
-    if (lead.theme) alreadyKnow.push('Theme/colour: ' + lead.theme); else missing.push('theme — "Koi specific theme ya colour scheme hai?"');
+    // Priority: function_list → services_needed → indoor_outdoor → theme → city_area → package_type
+    if (meta.function_list) alreadyKnow.push('Functions: ' + meta.function_list); else missing.push('function_list — "Aur kya functions plan hain? Mehendi, haldi, sangeet, reception?"');
+    if (meta.services_needed) alreadyKnow.push('Services: ' + meta.services_needed); else missing.push('services_needed — "Kaun si services chahiye? Decoration, photography, DJ, lighting?"');
+    if (meta.indoor_outdoor) alreadyKnow.push('Indoor/Outdoor: ' + meta.indoor_outdoor); else missing.push('indoor_outdoor — "Event indoor hoga ya outdoor?"');
+    if (meta.theme) alreadyKnow.push('Theme: ' + meta.theme); else missing.push('theme — "Koi specific theme ya colour scheme hai?"');
     if (!venueIsOurs) {
-      if (lead.city) alreadyKnow.push('City/Area: ' + lead.city);
-      else missing.push('city_area — "Aap kis area mein event karna chahte hain?" (SIRF isliye poocho kyunki venue hamare 7 partner venues mein se nahi hai)');
+      if (meta.city) alreadyKnow.push('City/Area: ' + meta.city);
+      else missing.push('city_area — "Aap kis area mein event karna chahte hain?"');
     } else {
-      if (lead.city) alreadyKnow.push('City/Area: ' + lead.city);
+      if (meta.city) alreadyKnow.push('City/Area: ' + meta.city);
     }
     if (lead.package_type) alreadyKnow.push('Package: ' + lead.package_type); else missing.push('package_type — "Budget ke hisaab se: simple, standard, premium ya luxury?"');
-    if (lead.preferred_call_time) alreadyKnow.push('Preferred call time: ' + lead.preferred_call_time);
+    if (meta.preferred_call_time) alreadyKnow.push('Preferred call time: ' + meta.preferred_call_time);
     if (lead.email) alreadyKnow.push('Email: ' + lead.email);
   }
 
-  var voiceContext = '';
-  if (lead && lead.call_count > 0) {
-    voiceContext = '\n\nVOICE CALL CONTEXT (BAHUT IMPORTANT):\n';
-    voiceContext += 'Is user se pehle ek voice call hua hai. Ab user WhatsApp pe message kar raha/rahi hai — SAME Aishwarya ho tum, conversation continue ho rahi hai.\n';
-    if (lead.call_summary && lead.call_summary.trim()) voiceContext += 'Call summary: ' + lead.call_summary + '\n';
-    if (lead.last_voice_transcript && lead.last_voice_transcript.trim()) voiceContext += 'Call transcript (partial): ' + lead.last_voice_transcript.substring(0, 800) + '\n';
-    voiceContext += '\nCall continuation rules:\n';
-    voiceContext += '- Call mein jo baat hui uska reference do naturally\n';
-    voiceContext += '- Jo data call pe collect hua woh DOBARA mat maango\n';
-    voiceContext += '- Sirf jo missing hai woh naturally poocho\n';
-  } else if (lead && lead.whatsapp_count > 0) {
-    voiceContext = '\n\nRETURNING WA USER: Pehle WhatsApp pe baat ho chuki hai. Warmly continue karo.';
+  // Returning user context
+  var returningContext = '';
+  if (lead && (lead.lead_score > 0 || (meta && Object.keys(meta).length > 0))) {
+    returningContext = '\n\nRETURNING USER: Is user se pehle baat ho chuki hai. Warmly continue karo. Jo pehle se pata hai woh DOBARA mat poocho.';
   }
 
   var allCollected = missing.length === 0;
@@ -336,55 +384,47 @@ async function callGroq(phone, userMessage, lead, history, knowledgeBase) {
   var leadContext = lead
     ? 'CUSTOMER KE BAARE MEIN JO PATA HAI:\n' +
       (alreadyKnow.length ? alreadyKnow.join('\n') : 'Kuch nahi pata abhi') +
-      '\n\nJO MISSING HAI (PRIORITY ORDER MEIN — EK-EK KARKE COLLECT KARO):\n' +
-      (allCollected ? 'SAARA DATA MIL GAYA! Support mode mein raho — aur koi naya sawaal nahi.' : missing.map(function(m, i) { return (i + 1) + '. ' + m; }).join('\n')) +
-      '\n\nJO PEHLE SE PATA HAI WOH BILKUL MAT POOCHO.' + voiceContext
-    : 'NAYA CUSTOMER — pehli baar baat ho rahi hai. Priority mein collect karo: naam, event type, event date, guest count, venue, function_list, services_needed, indoor_outdoor, theme, package_type.';
+      '\n\nJO MISSING HAI (PRIORITY ORDER — EK-EK KARKE):\n' +
+      (allCollected ? 'SAARA DATA MIL GAYA! Support mode mein raho.' : missing.map(function(m, i) { return (i+1) + '. ' + m; }).join('\n')) +
+      '\n\nJO PEHLE SE PATA HAI WOH BILKUL MAT POOCHO.' + returningContext
+    : 'NAYA CUSTOMER — pehli baar baat ho rahi hai. Collect karo: naam, event type, event date, guest count, venue, function_list, services_needed, indoor_outdoor, theme, package_type.';
 
   var systemPrompt =
     'Tu Aishwarya hai — Phoenix Events & Production ki WhatsApp assistant, Pimpri-Chinchwad, Pune se.\n\n' +
 
     'LANGUAGE RULE — SABSE IMPORTANT:\n' +
-    'HAMESHA Hinglish mein baat kar — yani Hindi words lekin Roman script mein likho.\n' +
-    'Example of CORRECT: "Aapka event indoor hoga ya outdoor?"\n' +
-    'Example of WRONG: "आपका इवेंट इंडोर होगा या आउटडोर?" — yeh mat karo\n' +
-    'Sirf ek exception: "यह हमारा वादा है" — yeh hamesha Devanagari mein likhna.\n' +
-    'KABHI bhi pure Devanagari mein poora message mat likhna.\n' +
+    'HAMESHA Hinglish mein baat kar — Hindi words, Roman script mein.\n' +
+    'CORRECT: "Aapka event indoor hoga ya outdoor?"\n' +
+    'WRONG: "आपका इवेंट इंडोर होगा या आउटडोर?"\n' +
+    'Sirf ek exception: "यह हमारा वादा है" — Devanagari mein.\n' +
     'KABHI English ya Marathi mein reply mat karo.\n\n' +
 
     'PERSONALITY:\n' +
-    '- Warm, bubbly, genuine — jaise ek helpful saheli jo genuinely events ke liye excited ho\n' +
-    '- Real insaan ki tarah baat kar — WhatsApp pe real friend jaisi\n' +
-    '- HAMESHA female words: bataungi, karungi, hoon, rahi hoon, samajh gayi — KABHI bataunga/karunga nahi\n' +
+    '- Warm, bubbly, genuine — helpful saheli ki tarah\n' +
+    '- HAMESHA female words: bataungi, karungi, hoon, rahi hoon\n' +
     '- User ko "aap" bolna\n' +
-    '- Natural reactions sirf genuinely fit hone pe: "Wah!", "Nice!", "Ekdum sahi!" — par sparingly\n\n' +
+    '- Natural reactions genuinely fit hone pe: "Wah!", "Nice!", "Ekdum sahi!"\n\n' +
 
-    'BANNED PHRASES — KABHI MAT BOLNA:\n' +
-    '- "Ab mujhe lagta hai..." ← robotic\n' +
-    '- "Maine saari zaroori jaankari prapt kar li" ← robotic\n' +
-    '- "Main aapko bata dungi" ← wrong gender + robotic\n' +
-    '- "Kya aap mujhe bata sakte hain..." ← too formal\n' +
-    '- "Main samajh gayi hoon ki aap..." ← too stiff\n' +
-    '- Any phrase that sounds like a customer service bot\n\n' +
+    'BANNED PHRASES:\n' +
+    '- "Ab mujhe lagta hai..."\n' +
+    '- "Maine saari jaankari prapt kar li"\n' +
+    '- "Kya aap mujhe bata sakte hain..."\n' +
+    '- Any robotic customer service phrase\n\n' +
 
     'RESPONSE STYLE:\n' +
-    '- 1-2 lines max — short, warm, WhatsApp-style ping\n' +
-    '- EK HI SAWAAL ek response mein — KABHI do sawaal ek saath nahi\n' +
-    '- *bold* important cheezein, emojis natural jagah pe\n' +
-    '- Bridge sentences use karo for smooth flow: "Achha, waise —", "By the way —", "Ek cheez aur —"\n' +
-    '- Seedha poocho, formal mat bano: "Indoor ya outdoor?" NOT "Kya aap bata sakte hain ki indoor hoga ya outdoor?"\n\n' +
-
-    'CONVERSATION FLOW — AISE KARO:\n' +
-    'GOOD: User: "Indoor" → Aishwarya: "Perfect, indoor! Waise, koi theme ya colour scheme hai mann mein? 🎨" [LEAD:indoor_outdoor=indoor]\n' +
-    'GOOD: User: "Golden" → Aishwarya: "Golden theme — ekdum elegant hoga! ✨ Hamare specialist jald call karenge. Koi sawaal ho toh batao!" [LEAD:theme=Golden]\n' +
-    'GOOD: User photo maange → Aishwarya: "Ye raha! [SEND:image=...] Aur ek cheez — aapka event indoor hoga ya outdoor?"\n' +
-    'BAD: "Bahut achha! Toh aapka birthday event indoor mein hoga. Ab mujhe lagta hai ki maine aapke event ke baare mein saari jaankari prapt kar li hai."\n\n' +
+    '- 1-2 lines max — short, warm, WhatsApp ping\n' +
+    '- EK HI SAWAAL per response — never two questions together\n' +
+    '- Bridge sentences: "Achha waise —", "Ek cheez aur —"\n' +
+    '- Seedha poocho: "Indoor ya outdoor?" NOT "Kya aap bata sakte hain..."\n\n' +
 
     'INDOOR/OUTDOOR RULE:\n' +
-    '- "Indoor", "andar", "inside" → save as indoor_outdoor=indoor\n' +
-    '- "Outdoor", "bahar", "lawn", "garden" → save as indoor_outdoor=outdoor\n' +
-    '- "Indore" ONLY if context is clearly about city → save as city=Indore\n' +
-    '- If user says "Indore" in response to "indoor ya outdoor?" question → treat as indoor, save indoor_outdoor=indoor\n\n' +
+    '- "Indoor", "andar" → indoor_outdoor=indoor\n' +
+    '- "Outdoor", "bahar", "lawn" → indoor_outdoor=outdoor\n' +
+    '- "Indore" as answer to indoor/outdoor → treat as indoor\n\n' +
+
+    'PRICING RULE — STRICT:\n' +
+    'Price ke baare mein KABHI koi number mat batao — chahe kitna bhi force kare.\n' +
+    '"Price ke liye hamare specialist se baat karein."\n\n' +
 
     'CUSTOMER STATUS:\n' + leadContext + '\n\n' +
 
@@ -396,61 +436,44 @@ async function callGroq(phone, userMessage, lead, history, knowledgeBase) {
     'Website: phoenixeventsandproduction.com | Instagram: @phoenix_events_and_production | Call: +91 80357 35856\n\n' +
 
     'PARTNER VENUES (7):\n' +
-    '1. Sky Blue Banquet Hall — Punawale/Ravet | 4.7 stars | 100-500 guests\n' +
-    '2. Blue Water Banquet Hall — Punawale | 5.0 stars | 50-300 guests\n' +
+    '1. Sky Blue Banquet Hall — Punawale/Ravet | 4.7★ | 100-500 guests\n' +
+    '2. Blue Water Banquet Hall — Punawale | 5.0★ | 50-300 guests\n' +
     '3. Thopate Banquets — Rahatani | 100-400 guests\n' +
-    '4. RamKrishna Veg Banquet — Ravet | 4.4 stars | 50-250 guests (veg only)\n' +
-    '5. Shree Krishna Palace — Pimpri Colony | 4.3 stars | 100-600 guests\n' +
-    '6. Raghunandan AC Banquet — Tathawade | 4.0 stars | 100-350 guests\n' +
-    '7. Rangoli Banquet Hall — Chinchwad | 4.3 stars | 100-500 guests\n\n' +
+    '4. RamKrishna Veg Banquet — Ravet | 4.4★ | 50-250 guests (veg only)\n' +
+    '5. Shree Krishna Palace — Pimpri Colony | 4.3★ | 100-600 guests\n' +
+    '6. Raghunandan AC Banquet — Tathawade | 4.0★ | 100-350 guests\n' +
+    '7. Rangoli Banquet Hall — Chinchwad | 4.3★ | 100-500 guests\n\n' +
 
-    'DATA COLLECTION RULES:\n' +
-    '- Jo pehle se pata hai WOH DOBARA MAT POOCHO — kabhi nahi, never\n' +
-    '- EK RESPONSE MEIN SIRF EK SAWAAL — strictly\n' +
-    '- Missing fields priority order mein collect karo — list mein jo pehle hai woh pehle poocho\n' +
-    '- Sawaal naturally weave karo — form ki tarah nahi, conversation ki tarah\n' +
-    '- User kuch aur pooche → pehle uska jawab do, PHIR bridge ke saath missing sawaal: "Achha waise —"\n' +
+    'DATA RULES:\n' +
+    '- Jo pehle se pata hai WOH DOBARA MAT POOCHO\n' +
+    '- EK RESPONSE MEIN SIRF EK SAWAAL\n' +
+    '- Missing fields priority order mein collect karo\n' +
     '- city_area SIRF tab poocho jab venue hamare 7 partner venues mein se nahi hai\n' +
-    '- Jab saare fields collect ho jaayein → support mode only, koi naya sawaal nahi\n\n' +
+    '- Summary SIRF jab user maange\n' +
+    '- Specialist ke liye: "hamare specialist call karenge" — kabhi "main call karungi" nahi\n\n' +
 
-    'SUMMARY RULE:\n' +
-    'KABHI apne aap summary mat bhejo. SIRF tab bhejo jab user specifically maange — "summary bhejo", "details batao", "kya save hua" jaisi baat kare tab hi.\n\n' +
+    'IMAGES:\n' +
+    'Jab event ya venue discuss ho → [SEND:image=event_wedding_image] jaisi keys use karo\n' +
+    'Events: event_wedding_image, event_birthday_image, event_engagement_image, event_sangeet_image,\n' +
+    'event_haldi_image, event_mehendi_image, event_anniversary_image, event_corporate_image\n' +
+    'Venues: venue_1_image (Sky Blue) through venue_7_image (Rangoli)\n\n' +
 
-    'SPECIALIST RULE:\n' +
-    'KABHI "main call karungi" ya "main callback duungi" mat bolna.\n' +
-    'HAMESHA "hamare specialist call karenge" ya "hamare team se call aayega" bolna.\n\n' +
-
-    'IMAGES (exact keys only — apni taraf se key kabhi mat banao):\n' +
-    'Events: [SEND:image=event_wedding_image], [SEND:image=event_birthday_image],\n' +
-    '[SEND:image=event_engagement_image], [SEND:image=event_sangeet_image],\n' +
-    '[SEND:image=event_haldi_image], [SEND:image=event_mehendi_image],\n' +
-    '[SEND:image=event_anniversary_image], [SEND:image=event_corporate_image]\n' +
-    'Venues: [SEND:image=venue_1_image] (Sky Blue) through [SEND:image=venue_7_image] (Rangoli)\n' +
-    'User photos/videos maange → turant bhejo. Event type change ho → us event ki images bhejo.\n\n' +
-
-    'STRICT RULES:\n' +
-    '- Sirf Phoenix Events topics pe baat karo\n' +
-    '- Off-topic: "Main sirf Phoenix Events ke baare mein help kar sakti hoon 😊"\n' +
-    '- Price kabhi mat batao: "Exact pricing ke liye hamare specialist se baat karein"\n' +
-    '- Disrespect: ek baar warn karo, dobara ho toh conversation khatam karo\n\n' +
-
-    'DATA TAGS (message ke BILKUL END mein — user ko nahi dikhte, invisible):\n' +
-    '[LEAD:name=Rahul] [LEAD:event_type=Wedding] [LEAD:venue=Sky Blue Banquet Hall]\n' +
-    '[LEAD:guest_count=200] [LEAD:event_date=15/06/2026] [LEAD:package_type=premium]\n' +
-    '[LEAD:services=decoration,photography] [LEAD:theme=Royal] [LEAD:indoor_outdoor=indoor]\n' +
-    '[LEAD:email=rahul@gmail.com] [LEAD:city=Pimpri-Chinchwad]\n' +
-    '[LEAD:functions=mehendi,sangeet] [LEAD:relationship=self] [LEAD:call_time=evening]\n' +
+    'DATA TAGS (message ke END mein — invisible):\n' +
+    '[LEAD:name=] [LEAD:event_type=] [LEAD:venue=] [LEAD:guest_count=] [LEAD:event_date=]\n' +
+    '[LEAD:package_type=] [LEAD:services=] [LEAD:theme=] [LEAD:indoor_outdoor=]\n' +
+    '[LEAD:email=] [LEAD:city=] [LEAD:functions=] [LEAD:relationship=] [LEAD:call_time=]\n' +
     '[LEAD:status=qualified] [LEAD:score+5]';
 
   var messages = [];
   history.forEach(function(h) {
-    messages.push({ role: h.direction === 'inbound' ? 'user' : 'assistant', content: h.content });
+    messages.push({ role: h.direction === 'inbound' ? 'user' : 'assistant', content: h.message || h.content || '' });
   });
   messages.push({ role: 'user', content: userMessage });
 
   try {
     var response = await axios.post('https://api.groq.com/openai/v1/chat/completions',
-      { model: 'llama-3.3-70b-versatile', max_tokens: 350, temperature: 0.5, messages: [{ role: 'system', content: systemPrompt }].concat(messages) },
+      { model: 'llama-3.3-70b-versatile', max_tokens: 350, temperature: 0.5,
+        messages: [{ role: 'system', content: systemPrompt }].concat(messages) },
       { headers: { 'Authorization': 'Bearer ' + GROQ_KEY, 'Content-Type': 'application/json' } }
     );
     var fullText = response.data.choices[0].message.content;
@@ -458,15 +481,22 @@ async function callGroq(phone, userMessage, lead, history, knowledgeBase) {
     return fullText;
   } catch (err) {
     console.error('Groq error:', JSON.stringify(err.response ? err.response.data : err.message));
-    return 'Ek second, thodi technical dikkat aa gayi. Kripya dobara try karein ya humein call karein: +91 80357 35856 🙏';
+    return 'Ek second, thodi technical dikkat aa gayi. Humein call karein: +91 80357 35856 🙏';
   }
 }
 
+// ── MAIN MESSAGE HANDLER ──
 async function handleMessage(phone, userMessage, name, msgId) {
   console.log('Message from:', phone, '| text:', userMessage.substring(0, 60));
   await logInbound(phone, userMessage, msgId);
 
-  var [lead, history, knowledgeBase] = await Promise.all([getLead(phone), getConversationHistory(phone), getKnowledgeBase()]);
+  var [lead, history, knowledgeBase] = await Promise.all([
+    getLead(phone),
+    getConversationHistory(phone),
+    getKnowledgeBase()
+  ]);
+
+  // Ensure lead exists
   await upsertLead(phone, name, {});
 
   var aiResponse = await callGroq(phone, userMessage, lead, history, knowledgeBase);
@@ -479,67 +509,133 @@ async function handleMessage(phone, userMessage, name, msgId) {
   var cleanResponse = cleanAiTags(aiResponse);
   await sendText(phone, cleanResponse);
 
-  // Send all media bundles with contextual captions
+  // Send images using new wp_media_assets system
   for (var i = 0; i < imagesToSend.length; i++) {
     try {
-      var bundle = await getMediaBundle(imagesToSend[i]);
-      for (var ii = 0; ii < bundle.images.length; ii++) {
-        await sleep(600);
-        await sendImage(phone, bundle.images[ii], getMediaCaption(imagesToSend[i], ii, false));
-      }
-      for (var jj = 0; jj < bundle.videos.length; jj++) {
-        await sleep(800);
-        await sendVideo(phone, bundle.videos[jj], getMediaCaption(imagesToSend[i], jj, true));
+      var key = imagesToSend[i];
+      // Determine if event or venue image
+      var eventMatch = key.match(/event_([a-z]+)_image/);
+      var venueMatch = key.match(/venue_(\d+)_image/);
+      if (eventMatch) {
+        var evType = eventMatch[1]; // wedding, birthday etc
+        await sendEventPortfolio(phone, evType);
+      } else if (venueMatch) {
+        var venueIdx = parseInt(venueMatch[1]);
+        var venueNames = ['Sky Blue Banquet Hall','Blue Water Banquet Hall','Thopate Banquets',
+          'RamKrishna Veg Banquet','Shree Krishna Palace','Raghunandan AC Banquet','Rangoli Banquet Hall'];
+        var vName = venueNames[venueIdx - 1] || 'Venue ' + venueIdx;
+        await sendVenuePortfolio(phone, vName);
       }
     } catch (e) { console.error('media send error:', e.message); }
   }
 
-  // Indore/indoor disambiguation
+  // Indore/indoor fix
   if (extracted.indoor_outdoor) {
-    var ioVal = String(extracted.indoor_outdoor).toLowerCase().trim();
-    // "Indore" typed while answering indoor/outdoor question = treat as indoor
-    if (ioVal === 'indore') extracted.indoor_outdoor = 'indoor';
+    if (String(extracted.indoor_outdoor).toLowerCase().trim() === 'indore') extracted.indoor_outdoor = 'indoor';
   }
-  // Fix if city was accidentally set to indoor/outdoor values
   if (extracted.city) {
-    var cityVal = String(extracted.city).toLowerCase().trim();
-    if (cityVal === 'indoor' || cityVal === 'andar') { extracted.indoor_outdoor = 'indoor'; delete extracted.city; }
-    else if (cityVal === 'outdoor' || cityVal === 'bahar') { extracted.indoor_outdoor = 'outdoor'; delete extracted.city; }
-    // Clean hallucinated city values (long text or contains venue/banquet keywords)
+    var cv = String(extracted.city).toLowerCase().trim();
+    if (cv === 'indoor' || cv === 'andar') { extracted.indoor_outdoor = 'indoor'; delete extracted.city; }
+    else if (cv === 'outdoor' || cv === 'bahar') { extracted.indoor_outdoor = 'outdoor'; delete extracted.city; }
     else if (extracted.city.length > 50 || /venue|banquet|hall|mentioned|customer|stated/i.test(extracted.city)) {
       delete extracted.city;
     }
   }
 
+  // Map venue field
   if (extracted.venue) { extracted.venue_name = extracted.venue; delete extracted.venue; }
 
+  // Urgency from event date
   if (extracted.event_date) {
     try {
       var parts = extracted.event_date.split('/');
       if (parts.length === 3) {
-        var days = Math.floor((new Date(parts[2], parts[1] - 1, parts[0]) - new Date()) / 86400000);
+        var days = Math.floor((new Date(parts[2], parts[1]-1, parts[0]) - new Date()) / 86400000);
         extracted.urgency_level = days <= 30 ? 'high' : days <= 90 ? 'medium' : 'low';
       }
     } catch (e) {}
   }
 
-  if (Object.keys(extracted).length > 0) {
-    var safeExtracted = Object.assign({}, extracted);
-    delete safeExtracted.venue_name;
-    var validFields = ['name','event_type','event_date','guest_count','venue','status','package_type',
-      'services_needed','theme','indoor_outdoor','email','city','source','function_list',
-      'relationship_to_event','preferred_call_time','instagram_id','urgency_level','callback_date','callback_time'];
-    var filteredExtracted = {};
-    Object.keys(safeExtracted).forEach(function(k) {
-      if (validFields.indexOf(k) !== -1) filteredExtracted[k] = safeExtracted[k];
-    });
-    if (Object.keys(filteredExtracted).length > 0) {
-      await upsertLead(phone, filteredExtracted.name || name, filteredExtracted);
-    }
+  // Fields that go to top-level vs metadata
+  var topLevelFields = ['name','email','status','event_type','package_type','urgency_level','lead_score'];
+  var topUpdate = {};
+  var metaUpdate = {};
+
+  Object.keys(extracted).forEach(function(k) {
+    if (topLevelFields.indexOf(k) !== -1) topUpdate[k] = extracted[k];
+    else metaUpdate[k] = extracted[k];
+  });
+
+  // Update last_message
+  if (userMessage) topUpdate.last_message = userMessage.substring(0, 200);
+
+  var allFields = Object.assign({}, topUpdate, metaUpdate);
+  if (Object.keys(allFields).length > 0) {
+    await upsertLead(phone, extracted.name || name, allFields);
   }
+
   if (scoreIncrement) await incrementLeadScore(phone, scoreIncrement);
 }
 
+// ── WEBSITE LEAD WEBHOOK ──
+// Called when website form is submitted — auto-send WA message
+app.post('/website-lead', async function(req, res) {
+  try {
+    res.json({ status: 'received' });
+    var data = req.body;
+    console.log('Website lead received:', JSON.stringify(data).substring(0, 200));
+
+    var phone = data.phone || data.mobile || data.contact;
+    var name = data.name || data.full_name || 'Friend';
+    var eventType = data.event || data.event_type || '';
+    var venue = data.venue || data.venue_name || '';
+
+    if (!phone) { console.log('Website lead: no phone, skipping'); return; }
+
+    // Clean phone — ensure Indian format
+    phone = String(phone).replace(/\D/g, '');
+    if (phone.length === 10) phone = '91' + phone;
+    if (phone.startsWith('0')) phone = '91' + phone.slice(1);
+
+    console.log('Website lead — phone:', phone, '| name:', name, '| event:', eventType, '| venue:', venue);
+
+    // Save to wp_leads
+    await upsertLead(phone, name, {
+      event_type: eventType,
+      source_channel: 'website',
+      metadata: { venue: venue, source: 'website_form' }
+    });
+
+    // Send greeting on WA
+    var greeting = 'Hi *' + name + '* ji! 😊\n\n';
+    greeting += 'Aapki enquiry mili — *' + (eventType || 'event') + '* ke liye';
+    if (venue) greeting += ', *' + venue + '* mein';
+    greeting += '!\n\n';
+    greeting += 'Main Aishwarya hoon — Phoenix Events & Production se. Abhi aapko kuch khoobsurat photos bhejti hoon! 📸✨';
+    await sendText(phone, greeting);
+    await sleep(1000);
+
+    // Send event portfolio if event type known
+    if (eventType) await sendEventPortfolio(phone, eventType);
+
+    // Send venue portfolio if venue known
+    if (venue) {
+      await sleep(500);
+      await sendVenuePortfolio(phone, venue);
+    }
+
+    await sleep(1000);
+
+    // Ask first missing question
+    var firstQ = eventType
+      ? ('*' + eventType + '* event ke liye — kab ka plan hai? Date approximate bhi chalegi! 📅')
+      : 'Kaunsa khaas occasion plan ho raha hai? 😊';
+    await sendText(phone, firstQ);
+
+  } catch (e) { console.error('website-lead error:', e.message); }
+});
+
+// ── WEBHOOK ROUTES ──
 app.get('/whatsapp', function(req, res) {
   var mode = req.query['hub.mode'];
   var token = req.query['hub.verify_token'];
@@ -577,8 +673,8 @@ app.post('/whatsapp', async function(req, res) {
 });
 
 app.get('/', function(req, res) {
-  res.json({ status: 'Phoenix WhatsApp AI Agent VERSION 7', timestamp: new Date().toISOString() });
+  res.json({ status: 'Phoenix WhatsApp AI Agent VERSION 8', timestamp: new Date().toISOString() });
 });
 
 var PORT = process.env.PORT || 3000;
-app.listen(PORT, function() { console.log('Phoenix WhatsApp AI Agent VERSION 7 running on port ' + PORT); });
+app.listen(PORT, function() { console.log('Phoenix WhatsApp AI Agent VERSION 8 running on port ' + PORT); });

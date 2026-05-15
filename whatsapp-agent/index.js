@@ -1,7 +1,36 @@
 const express = require('express');
 const axios = require('axios');
 const app = express();
-app.use(express.json());
+
+var ALLOWED_ORIGINS = [
+  'https://phoenixeventsandproduction.com',
+  'https://www.phoenixeventsandproduction.com',
+  'http://localhost:8085',
+  'http://localhost:5173',
+  'http://127.0.0.1:8085',
+  'http://127.0.0.1:5173'
+];
+if (process.env.ADMIN_CORS_ORIGIN) {
+  process.env.ADMIN_CORS_ORIGIN.split(',').forEach(function(o) {
+    var t = o.trim();
+    if (t && ALLOWED_ORIGINS.indexOf(t) === -1) ALLOWED_ORIGINS.push(t);
+  });
+}
+
+app.use(function(req, res, next) {
+  var origin = req.headers.origin;
+  if (origin && ALLOWED_ORIGINS.indexOf(origin) !== -1) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-wp-admin-secret');
+    res.setHeader('Access-Control-Max-Age', '86400');
+  }
+  if (req.method === 'OPTIONS') return res.status(204).end();
+  next();
+});
+
+app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 process.on('uncaughtException', function(err) { console.error('UNCAUGHT EXCEPTION:', err); });
@@ -15,6 +44,13 @@ const WA_TOKEN = process.env.WA_TOKEN;
 const WA_PHONE_ID = process.env.WA_PHONE_ID;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'phoenix_verify_2024';
 const GROQ_KEY = process.env.GROQ_API_KEY;
+const WP_ADMIN_SECRET = process.env.WP_ADMIN_SECRET || '';
+
+function requireAdmin(req, res, next) {
+  if (!WP_ADMIN_SECRET) return next();
+  if (req.headers['x-wp-admin-secret'] === WP_ADMIN_SECRET) return next();
+  return res.status(401).json({ error: 'Unauthorized' });
+}
 
 console.log('SUPABASE_KEY:', SUPABASE_KEY ? 'Loaded' : 'MISSING');
 console.log('WA_TOKEN:', WA_TOKEN ? 'Loaded' : 'MISSING');
@@ -125,11 +161,11 @@ async function sendText(phone, message) {
       );
       if (chunks.length > 1) await sleep(600);
     }
-    await logOutbound(phone, message);
+    await logOutbound(phone, message, 'text', { source: 'agent' });
   } catch (e) { console.error('sendText FAILED:', JSON.stringify(e.response ? e.response.data : e.message)); }
 }
 
-async function sendImage(phone, imageUrl, caption) {
+async function sendImage(phone, imageUrl, caption, logMeta) {
   try {
     if (!imageUrl) { console.log('sendImage: no imageUrl, skipping'); return; }
     var fp = phone.startsWith('+') ? phone : '+' + phone;
@@ -139,10 +175,12 @@ async function sendImage(phone, imageUrl, caption) {
       { headers: { Authorization: 'Bearer ' + WA_TOKEN, 'Content-Type': 'application/json' } }
     );
     console.log('Image sent OK to', phone);
+    var label = caption && caption.trim() ? caption.trim() : 'Photo sent';
+    await logOutbound(phone, label, 'image', Object.assign({ media_url: imageUrl }, logMeta || {}));
   } catch (e) { console.error('sendImage FAILED:', JSON.stringify(e.response ? e.response.data : e.message)); }
 }
 
-async function sendVideo(phone, videoUrl, caption) {
+async function sendVideo(phone, videoUrl, caption, logMeta) {
   try {
     if (!videoUrl) return;
     var fp = phone.startsWith('+') ? phone : '+' + phone;
@@ -151,14 +189,38 @@ async function sendVideo(phone, videoUrl, caption) {
       { headers: { Authorization: 'Bearer ' + WA_TOKEN, 'Content-Type': 'application/json' } }
     );
     console.log('Video sent OK to', phone);
+    var label = caption && caption.trim() ? caption.trim() : 'Video sent';
+    await logOutbound(phone, label, 'video', Object.assign({ media_url: videoUrl }, logMeta || {}));
   } catch (e) { console.error('sendVideo FAILED:', JSON.stringify(e.response ? e.response.data : e.message)); }
+}
+
+async function sendDocument(phone, docUrl, filename, caption, logMeta) {
+  try {
+    if (!docUrl) return;
+    var fp = phone.startsWith('+') ? phone : '+' + phone;
+    var docPayload = { link: docUrl };
+    if (filename) docPayload.filename = filename;
+    if (caption) docPayload.caption = caption;
+    await axios.post('https://graph.facebook.com/v18.0/' + WA_PHONE_ID + '/messages',
+      { messaging_product: 'whatsapp', to: fp, type: 'document', document: docPayload },
+      { headers: { Authorization: 'Bearer ' + WA_TOKEN, 'Content-Type': 'application/json' } }
+    );
+    console.log('Document sent OK to', phone);
+    var label = caption && caption.trim() ? caption.trim() : (filename ? 'Document: ' + filename : 'Document sent');
+    await logOutbound(phone, label, 'document', Object.assign({ media_url: docUrl, filename: filename || null }, logMeta || {}));
+  } catch (e) { console.error('sendDocument FAILED:', JSON.stringify(e.response ? e.response.data : e.message)); }
 }
 
 async function sendYoutubeLink(phone, youtubeId, caption) {
   try {
     if (!youtubeId) return;
     var msg = (caption ? caption + '\n' : '') + 'https://www.youtube.com/watch?v=' + youtubeId;
-    await sendText(phone, msg);
+    var fp = phone.startsWith('+') ? phone : '+' + phone;
+    await axios.post('https://graph.facebook.com/v18.0/' + WA_PHONE_ID + '/messages',
+      { messaging_product: 'whatsapp', to: fp, type: 'text', text: { body: msg } },
+      { headers: { Authorization: 'Bearer ' + WA_TOKEN, 'Content-Type': 'application/json' } }
+    );
+    await logOutbound(phone, (caption || 'Video link') + ' — YouTube', 'video', { youtube_id: youtubeId, media_url: 'https://www.youtube.com/watch?v=' + youtubeId, source: 'agent' });
   } catch (e) {}
 }
 
@@ -216,11 +278,25 @@ async function logInbound(phone, message, msgId) {
   } catch (e) {}
 }
 
-async function logOutbound(phone, message) {
+async function logOutbound(phone, message, messageType, metadata) {
   try {
     var lead = await getLead(phone);
-    await supabase.post('/rest/v1/wp_conversations', { lead_id: lead ? lead.id : null, lead_phone: phone, direction: 'outbound', message: message, message_type: 'text' });
+    await supabase.post('/rest/v1/wp_conversations', {
+      lead_id: lead ? lead.id : null,
+      lead_phone: phone,
+      direction: 'outbound',
+      message: message || '',
+      message_type: messageType || 'text',
+      metadata: metadata || {}
+    });
   } catch (e) {}
+}
+
+function normalizePhone(phone) {
+  phone = String(phone || '').replace(/\D/g, '');
+  if (phone.length === 10) phone = '91' + phone;
+  if (phone.startsWith('0')) phone = '91' + phone.slice(1);
+  return phone;
 }
 
 // ── MEDIA — RPC-based with 3-level fallback ──
@@ -746,14 +822,50 @@ app.post('/website-lead', async function(req, res) {
   } catch (e) { console.error('website-lead error:', e.message); }
 });
 
+// ── ADMIN: send text / image / video / document (from admin dashboard) ──
+app.post('/admin-send-media', requireAdmin, async function(req, res) {
+  try {
+    var data = req.body || {};
+    var phone = normalizePhone(data.phone);
+    var mediaType = String(data.media_type || 'text').toLowerCase();
+    var url = data.url || data.media_url || '';
+    var caption = data.caption || data.message || '';
+    var filename = data.filename || '';
+    if (!phone) return res.status(400).json({ error: 'phone required' });
+
+    var logMeta = { source: 'admin' };
+
+    if (mediaType === 'text') {
+      var text = data.message || caption;
+      if (!text) return res.status(400).json({ error: 'message required' });
+      await sendText(phone, text);
+      return res.json({ status: 'sent', type: 'text' });
+    }
+    if (!url) return res.status(400).json({ error: 'url required for media' });
+
+    if (mediaType === 'image') {
+      await sendImage(phone, url, caption, logMeta);
+    } else if (mediaType === 'video') {
+      await sendVideo(phone, url, caption, logMeta);
+    } else if (mediaType === 'document') {
+      await sendDocument(phone, url, filename, caption, logMeta);
+    } else {
+      return res.status(400).json({ error: 'media_type must be text, image, video, or document' });
+    }
+    return res.json({ status: 'sent', type: mediaType });
+  } catch (e) {
+    console.error('admin-send-media error:', e.message);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
 // ── SCHEDULE FOLLOWUP ──
-app.post('/schedule-followup', async function(req, res) {
+app.post('/schedule-followup', requireAdmin, async function(req, res) {
   try {
     var data = req.body;
     var phone = data.phone; var message = data.message; var sendNow = data.send_now || false;
-    if (!phone || !message) return res.json({ error: 'phone and message required' });
-    phone = String(phone).replace(/\D/g, '');
-    if (phone.length === 10) phone = '91' + phone;
+    if (!phone || !message) return res.status(400).json({ error: 'phone and message required' });
+    phone = normalizePhone(phone);
     if (sendNow) { await sendText(phone, message); return res.json({ status: 'sent' }); }
     var scheduledAt = data.scheduled_at || new Date(Date.now() + 3600000).toISOString();
     var lead = await getLead(phone);
@@ -763,7 +875,7 @@ app.post('/schedule-followup', async function(req, res) {
 });
 
 // ── PROCESS PENDING FOLLOWUPS ──
-app.post('/process-followups', async function(req, res) {
+app.post('/process-followups', requireAdmin, async function(req, res) {
   try {
     res.json({ status: 'processing' });
     var now = new Date().toISOString();

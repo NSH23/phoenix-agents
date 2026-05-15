@@ -17,9 +17,20 @@ if (process.env.ADMIN_CORS_ORIGIN) {
   });
 }
 
+function isAllowedAdminOrigin(origin) {
+  if (!origin) return false;
+  if (ALLOWED_ORIGINS.indexOf(origin) !== -1) return true;
+  try {
+    var host = new URL(origin).hostname.toLowerCase();
+    if (host === 'phoenixeventsandproduction.com' || host.endsWith('.phoenixeventsandproduction.com')) return true;
+    if (host.endsWith('.vercel.app')) return true;
+  } catch (e) {}
+  return false;
+}
+
 app.use(function(req, res, next) {
   var origin = req.headers.origin;
-  if (origin && ALLOWED_ORIGINS.indexOf(origin) !== -1) {
+  if (isAllowedAdminOrigin(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Vary', 'Origin');
     res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
@@ -150,7 +161,7 @@ function getVenueIndex(venueName) {
 }
 
 // ── WA SEND ──
-async function sendText(phone, message) {
+async function sendText(phone, message, logMeta) {
   try {
     var fp = phone.startsWith('+') ? phone : '+' + phone;
     var chunks = splitMessage(message);
@@ -161,8 +172,8 @@ async function sendText(phone, message) {
       );
       if (chunks.length > 1) await sleep(600);
     }
-    await logOutbound(phone, message, 'text', { source: 'agent' });
-  } catch (e) { console.error('sendText FAILED:', JSON.stringify(e.response ? e.response.data : e.message)); }
+    await logOutbound(phone, message, 'text', Object.assign({ source: 'agent' }, logMeta || {}));
+  } catch (e) { console.error('sendText FAILED:', JSON.stringify(e.response ? e.response.data : e.message)); throw e; }
 }
 
 async function sendImage(phone, imageUrl, caption, logMeta) {
@@ -859,34 +870,113 @@ app.post('/admin-send-media', requireAdmin, async function(req, res) {
   }
 });
 
-// ── SCHEDULE FOLLOWUP ──
+// ── FOLLOW-UPS (text + optional media, schedule or send now) ──
+function buildFollowupMediaMeta(data) {
+  var url = data.media_url || data.url || '';
+  var mediaType = data.media_type ? String(data.media_type).toLowerCase() : '';
+  if (!url || !mediaType) return null;
+  return {
+    media_type: mediaType,
+    media_url: url,
+    filename: data.filename || '',
+    caption: data.caption || data.media_caption || ''
+  };
+}
+
+async function deliverFollowupPayload(phone, message, metadata, logSource) {
+  phone = normalizePhone(phone);
+  var logMeta = { source: logSource || 'admin' };
+  var meta = metadata && typeof metadata === 'object' ? metadata : {};
+  var hasText = message && String(message).trim();
+  var hasMedia = meta.media_url && meta.media_type;
+
+  if (!hasText && !hasMedia) throw new Error('nothing to send');
+
+  if (hasText) {
+    await sendText(phone, String(message).trim(), logMeta);
+    await sleep(800);
+  }
+  if (hasMedia) {
+    var mt = String(meta.media_type).toLowerCase();
+    var cap = meta.caption || '';
+    if (mt === 'image') await sendImage(phone, meta.media_url, cap, logMeta);
+    else if (mt === 'video') await sendVideo(phone, meta.media_url, cap, logMeta);
+    else if (mt === 'document') await sendDocument(phone, meta.media_url, meta.filename || '', cap, logMeta);
+    else throw new Error('unsupported media_type: ' + mt);
+    await sleep(800);
+  }
+}
+
+async function runPendingFollowups() {
+  var now = new Date().toISOString();
+  var result = await supabase.get(
+    '/rest/v1/wp_followups?status=eq.pending&scheduled_at=lte.' + encodeURIComponent(now) +
+    '&select=*&limit=50&order=scheduled_at.asc'
+  );
+  if (!result.data || result.data.length === 0) return { processed: 0, total: 0 };
+  var sent = 0;
+  for (var i = 0; i < result.data.length; i++) {
+    var f = result.data[i];
+    try {
+      await deliverFollowupPayload(f.lead_phone, f.message, f.metadata || {}, 'admin');
+      await supabase.patch('/rest/v1/wp_followups?id=eq.' + f.id, {
+        status: 'sent',
+        updated_at: new Date().toISOString()
+      });
+      sent++;
+      await sleep(1000);
+    } catch (e) {
+      console.error('Followup failed:', f.lead_phone, f.id, e.message);
+      await supabase.patch('/rest/v1/wp_followups?id=eq.' + f.id, {
+        status: 'failed',
+        updated_at: new Date().toISOString()
+      });
+    }
+  }
+  console.log('Processed followups:', sent, '/', result.data.length);
+  return { processed: sent, total: result.data.length };
+}
+
 app.post('/schedule-followup', requireAdmin, async function(req, res) {
   try {
-    var data = req.body;
-    var phone = data.phone; var message = data.message; var sendNow = data.send_now || false;
-    if (!phone || !message) return res.status(400).json({ error: 'phone and message required' });
+    var data = req.body || {};
+    var phone = data.phone;
+    var message = data.message || '';
+    var sendNow = data.send_now || false;
+    var mediaMeta = buildFollowupMediaMeta(data);
+    if (!phone) return res.status(400).json({ error: 'phone required' });
+    if (!String(message).trim() && !mediaMeta) return res.status(400).json({ error: 'message or media required' });
     phone = normalizePhone(phone);
-    if (sendNow) { await sendText(phone, message); return res.json({ status: 'sent' }); }
+    var metadata = mediaMeta || {};
+    if (sendNow) {
+      await deliverFollowupPayload(phone, message, metadata, 'admin');
+      return res.json({ status: 'sent' });
+    }
     var scheduledAt = data.scheduled_at || new Date(Date.now() + 3600000).toISOString();
     var lead = await getLead(phone);
-    await supabase.post('/rest/v1/wp_followups', { lead_id: lead ? lead.id : null, lead_phone: phone, scheduled_at: scheduledAt, message: message, status: 'pending' });
+    await supabase.post('/rest/v1/wp_followups', {
+      lead_id: lead ? lead.id : null,
+      lead_phone: phone,
+      scheduled_at: scheduledAt,
+      message: String(message).trim() || null,
+      metadata: metadata,
+      status: 'pending'
+    });
     return res.json({ status: 'scheduled', scheduled_at: scheduledAt });
-  } catch (e) { console.error('schedule-followup error:', e.message); res.json({ error: e.message }); }
+  } catch (e) {
+    console.error('schedule-followup error:', e.message);
+    return res.status(500).json({ error: e.message });
+  }
 });
 
-// ── PROCESS PENDING FOLLOWUPS ──
 app.post('/process-followups', requireAdmin, async function(req, res) {
   try {
-    res.json({ status: 'processing' });
-    var now = new Date().toISOString();
-    var result = await supabase.get('/rest/v1/wp_followups?status=eq.pending&scheduled_at=lte.' + now + '&select=*&limit=50');
-    if (!result.data || result.data.length === 0) { console.log('No pending followups'); return; }
-    for (var i = 0; i < result.data.length; i++) {
-      var f = result.data[i];
-      try { await sendText(f.lead_phone, f.message); await supabase.patch('/rest/v1/wp_followups?id=eq.' + f.id, { status: 'sent' }); await sleep(1000); }
-      catch (e) { console.error('Followup failed:', f.lead_phone, e.message); }
-    }
-  } catch (e) { console.error('process-followups error:', e.message); }
+    var result = await runPendingFollowups();
+    return res.json(Object.assign({ status: 'ok' }, result));
+  } catch (e) {
+    console.error('process-followups error:', e.message);
+    return res.status(500).json({ error: e.message });
+  }
 });
 
 // ── WHATSAPP WEBHOOK ──
@@ -932,11 +1022,27 @@ app.get('/privacy-policy', function(req, res) {
 });
 
 var PORT = process.env.PORT || 3000;
+var WP_FOLLOWUP_POLL_MS = parseInt(process.env.WP_FOLLOWUP_POLL_MS || '60000', 10);
+var followupPollBusy = false;
+
 var server = app.listen(PORT, '0.0.0.0', function() {
   console.log('================================');
   console.log('Phoenix WhatsApp — Aishwarya v13');
   console.log('Port: ' + PORT);
+  console.log('Follow-up auto-poll every ' + WP_FOLLOWUP_POLL_MS + 'ms');
   console.log('================================');
+
+  setInterval(function() {
+    if (followupPollBusy) return;
+    followupPollBusy = true;
+    runPendingFollowups()
+      .catch(function(e) { console.error('followup poll error:', e.message); })
+      .finally(function() { followupPollBusy = false; });
+  }, WP_FOLLOWUP_POLL_MS);
+
+  setTimeout(function() {
+    runPendingFollowups().catch(function(e) { console.error('followup startup poll:', e.message); });
+  }, 20000);
 });
 server.keepAliveTimeout = 120000;
 server.headersTimeout = 120000;
